@@ -1027,7 +1027,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",  # Enable LoRA for action expert
         ),
         data=LeRobotZenoDataConfig(
-            repo_id="zeno/npm_dualarm_tasks_v1",
+            repo_id="zeno/sweep2E",
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("action",),  # Specify the action key from dataset
