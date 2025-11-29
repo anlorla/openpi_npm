@@ -353,6 +353,67 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
         )
 
+# Edited by Yifan
+@dataclasses.dataclass(frozen=True)
+class LeRobotZenoDataConfig(DataConfigFactory):
+    """
+    Config for Zeno PiPER dataset.
+    This is a dual-arm robot with:
+    - 16-dim state (8 dims per arm)
+    - 14-dim action (7 dims per arm)
+    - 3 cameras (main/top + left wrist + right wrist)
+    """
+
+    extra_delta_transform: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform maps dataset keys to the keys expected by the data transforms.
+        # Dataset keys use "/" separator after being stored by LeRobot.
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image":        "observation.images.main",
+                        "observation/wrist_image": "observation.images.secondary_0",
+                        "observation/right_wrist_image": "observation.images.secondary_1",
+                        "observation/state":              "observation.state",
+                        "actions":                         "action",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+
+        # Use Libero policy transforms as a base since the data structure is similar
+        # LiberoInputs will handle the image and state inputs
+        # Note: LiberoOutputs returns only first 7 actions, we need all 14 for dual-arm
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+
+        # For dual-arm robot: apply delta transform to all joint actions (14 dims total)
+        # Each arm has 7 joints: 6 regular joints + 1 gripper
+        # We apply delta to joints but keep gripper absolute for both arms
+        if self.extra_delta_transform:
+            # Left arm: joints 0-5 delta, joint 6 (gripper) absolute
+            # Right arm: joints 7-12 delta, joint 13 (gripper) absolute
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
@@ -921,6 +982,82 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
     ),
+
+    # Edited by Yifan
+    # NPM tasks - PiPER (Full Fine-tuning)
+    TrainConfig(
+        name="pi05_npm",
+        # Dual-arm robot with 14-dim actions (7 per arm) and 16-dim state (8 per arm)
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotZenoDataConfig(
+            repo_id="zeno/npm_dualarm_tasks_v1",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),  # Specify the action key from dataset
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path=None,  # not use for now
+        num_train_steps=30_000,
+    ),
+    # NPM tasks - PiPER (LoRA Fine-tuning for low memory)
+    TrainConfig(
+        name="pi05_npm_lora",
+        # Dual-arm robot with 14-dim actions (7 per arm) and 16-dim state (8 per arm)
+        # Using LoRA for memory-efficient fine-tuning
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",  # Enable LoRA for vision-language model
+            action_expert_variant="gemma_300m_lora",  # Enable LoRA for action expert
+        ),
+        data=LeRobotZenoDataConfig(
+            repo_id="zeno/npm_dualarm_tasks_v1",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),  # Specify the action key from dataset
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # Freeze filter: freeze all non-LoRA parameters
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=14,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path=None,  # not use for now
+        num_train_steps=30_000,
+    ),
+
     #
     # Debugging configs.
     #
