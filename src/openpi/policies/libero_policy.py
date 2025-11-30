@@ -49,6 +49,8 @@ class LiberoInputs(transforms.DataTransformFn):
         # and two wrist views (left and right). If your dataset does not have a particular type
         # of image, e.g. wrist images, you can comment it out here and replace it with zeros like we do for the
         # right wrist image below.
+        # 
+        #Edited by Yifan
         base_image = _parse_image(data["observation/image"])
         wrist_image = _parse_image(data["observation/wrist_image"])
         right_wrist_image = _parse_image(data["observation/right_wrist_image"])
@@ -91,7 +93,7 @@ class LiberoOutputs(transforms.DataTransformFn):
 
     For your own dataset, you can copy this class and modify the action dimension based on the comments below.
     """
-
+    # Edited by Yifan
     def __call__(self, data: dict) -> dict:
         # Only return the first N actions -- since we padded actions above to fit the model action
         # dimension, we need to now parse out the correct number of actions in the return dict.
