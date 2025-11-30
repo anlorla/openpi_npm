@@ -90,7 +90,7 @@ def collect_bag_files_huggingface(task_name):
         all_files = list_repo_files(repo_id=HF_DATASET_REPO, repo_type="dataset")
 
         # Filter for .bag files for this task
-        bag_filenames = [f for f in all_files if f.endswith(".bag") and task_name in f]
+        bag_filenames = [f for f in all_files if f.endswith(".bag")]
         bag_filenames = sorted(bag_filenames)
 
         if not bag_filenames:
@@ -385,7 +385,6 @@ for task_name in TASK_NAMES:
                 state_vec[:n_sl] = q_robot_left[:n_sl]
                 state_vec[8 : 8 + n_sr] = q_robot_right[:n_sr]
 
-                # 14 维 action: 7 左 + 7 右
                 q_tele_left = np.array(
                     action_left_msg.position, dtype=np.float32
                 )

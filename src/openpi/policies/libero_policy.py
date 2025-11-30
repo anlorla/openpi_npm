@@ -51,7 +51,7 @@ class LiberoInputs(transforms.DataTransformFn):
         # right wrist image below.
         base_image = _parse_image(data["observation/image"])
         wrist_image = _parse_image(data["observation/wrist_image"])
-
+        right_wrist_image = _parse_image(data["observation/right_wrist_image"])
         # Create inputs dict. Do not change the keys in the dict below.
         inputs = {
             "state": data["observation/state"],
@@ -59,7 +59,7 @@ class LiberoInputs(transforms.DataTransformFn):
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,
                 # Pad any non-existent images with zero-arrays of the appropriate shape.
-                "right_wrist_0_rgb": np.zeros_like(base_image),
+                "right_wrist_0_rgb": right_wrist_image,
             },
             "image_mask": {
                 "base_0_rgb": np.True_,
@@ -97,4 +97,4 @@ class LiberoOutputs(transforms.DataTransformFn):
         # dimension, we need to now parse out the correct number of actions in the return dict.
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        return {"actions": np.asarray(data["actions"][:, :14])}

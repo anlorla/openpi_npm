@@ -1034,7 +1034,7 @@ _CONFIGS = [
             ),
             extra_delta_transform=False,
         ),
-        batch_size=256,
+        batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -1055,7 +1055,7 @@ _CONFIGS = [
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path=None,  # not use for now
-        num_train_steps=30_000,
+        num_train_steps=3000,
     ),
 
     #
