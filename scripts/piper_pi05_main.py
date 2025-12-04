@@ -19,6 +19,12 @@ latest_q = {
     "right": None,
 }
 
+# Smoothing: Store previous smoothed actions for EMA filter
+smoothed_action = {
+    "left": None,
+    "right": None,
+}
+
 # Callback for main (top) camera
 def cb_main(msg):
     latest_imgs["main"] = bridge.compressed_imgmsg_to_cv2(msg, desired_encoding="bgr8")
@@ -69,12 +75,16 @@ def main():
     )
 
     # SAFETY: Use low control frequency for initial testing
-    rate = rospy.Rate(0.5)  # Run at 0.5 Hz (once every 2 seconds) for safety
-    prompt = "sweep the blocks into an E shape"
+    rate = rospy.Rate(10)  # Run at 1 Hz (once every second) for safety
+    prompt = "pass cucumber from left to right"
 
     # Safety parameters
-    MAX_JOINT_DELTA = 0.5  # Maximum joint position change per step (radians)
-    ENABLE_ACTION_CLIPPING = True  # Clip large action deltas for safety
+    MAX_JOINT_DELTA = 0.15 # Maximum joint position change per step (radians)
+    ENABLE_ACTION_CLIPPING = False  # Clip large action deltas for safety
+
+    # Smoothing parameters
+    ENABLE_SMOOTHING = False  # Enable EMA smoothing for smoother motion
+    SMOOTHING_ALPHA = 0.3  # EMA smoothing factor (0-1): lower=smoother but slower, higher=more responsive but less smooth
 
     rospy.loginfo("Waiting for sensor data from robot arms...")
     data_ready_logged = False
@@ -131,6 +141,21 @@ def main():
         # Assuming action is 14-dim: [left_7_joints, right_7_joints]
         action_left = a0[:7]
         action_right = a0[7:14]
+
+        # SMOOTHING: Apply EMA (Exponential Moving Average) filter for smoother motion
+        if ENABLE_SMOOTHING:
+            if smoothed_action["left"] is None:
+                # Initialize with current action on first run
+                smoothed_action["left"] = action_left.copy()
+                smoothed_action["right"] = action_right.copy()
+            else:
+                # Apply EMA: smoothed = alpha * new + (1-alpha) * previous
+                smoothed_action["left"] = SMOOTHING_ALPHA * action_left + (1 - SMOOTHING_ALPHA) * smoothed_action["left"]
+                smoothed_action["right"] = SMOOTHING_ALPHA * action_right + (1 - SMOOTHING_ALPHA) * smoothed_action["right"]
+
+                action_left = smoothed_action["left"]
+                action_right = smoothed_action["right"]
+                rospy.logdebug(f"Applied EMA smoothing with alpha={SMOOTHING_ALPHA}")
 
         # SAFETY: Check and clip action deltas if needed
         if ENABLE_ACTION_CLIPPING:
