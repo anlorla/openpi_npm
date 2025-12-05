@@ -75,8 +75,8 @@ def main():
     )
 
     # SAFETY: Use low control frequency for initial testing
-    rate = rospy.Rate(10)  # Run at 1 Hz (once every second) for safety
-    prompt = "pass cucumber from left to right"
+    rate = rospy.Rate(50)  # Run at 50 Hz for smoother control
+    prompt = "Push the block to the right and then move both arms back to the home pose."
 
     # Safety parameters
     MAX_JOINT_DELTA = 0.15 # Maximum joint position change per step (radians)
