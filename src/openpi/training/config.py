@@ -1027,7 +1027,7 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",  # Enable LoRA for action expert
         ),
         data=LeRobotZenoDataConfig(
-            repo_id="zeno/pass_cucumber",
+            repo_id="zeno/push_block_dual",
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("action",),  # Specify the action key from dataset
@@ -1036,7 +1036,7 @@ _CONFIGS = [
         ),
         batch_size=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=8_000,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
@@ -1056,6 +1056,48 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path=None,  # not use for now
         num_train_steps=3000,
+    ),
+    TrainConfig(
+        name="pi0_npm_lora",
+        # Dual-arm robot with 14-dim actions (7 per arm) and 16-dim state (8 per arm)
+        # Using LoRA for memory-efficient fine-tuning
+        model=pi0_config.Pi0Config(
+            pi05=False,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",  # Enable LoRA for vision-language model
+            action_expert_variant="gemma_300m_lora",  # Enable LoRA for action expert
+        ),
+        data=LeRobotZenoDataConfig(
+            repo_id="zeno/push_block",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),  # Specify the action key from dataset
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=0.0001,
+            decay_steps=10000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # Freeze filter: freeze all non-LoRA parameters
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=False,
+            action_dim=14,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # Turn off EMA for LoRA finetuning
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path=None,  # not use for now
+        num_train_steps=10000,
     ),
 
     #

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import cv2
 import numpy as np
 import rospy
 from sensor_msgs.msg import CompressedImage, JointState
@@ -15,12 +16,6 @@ latest_imgs = {
     "wrist_r": None,
 }
 latest_q = {
-    "left": None,
-    "right": None,
-}
-
-# Smoothing: Store previous smoothed actions for EMA filter
-smoothed_action = {
     "left": None,
     "right": None,
 }
@@ -75,16 +70,8 @@ def main():
     )
 
     # SAFETY: Use low control frequency for initial testing
-    rate = rospy.Rate(50)  # Run at 50 Hz for smoother control
+    rate = rospy.Rate(10)  # Run at 10 Hz to match training data collection frequency
     prompt = "Push the block to the right and then move both arms back to the home pose."
-
-    # Safety parameters
-    MAX_JOINT_DELTA = 0.15 # Maximum joint position change per step (radians)
-    ENABLE_ACTION_CLIPPING = False  # Clip large action deltas for safety
-
-    # Smoothing parameters
-    ENABLE_SMOOTHING = False  # Enable EMA smoothing for smoother motion
-    SMOOTHING_ALPHA = 0.3  # EMA smoothing factor (0-1): lower=smoother but slower, higher=more responsive but less smooth
 
     rospy.loginfo("Waiting for sensor data from robot arms...")
     data_ready_logged = False
@@ -99,19 +86,28 @@ def main():
             rospy.loginfo("✓ Successfully receiving observations from robot arms (cameras + joint states)")
             data_ready_logged = True
 
+        # Convert images from BGR (ROS default) to RGB
+        rgb_main = cv2.cvtColor(latest_imgs["main"], cv2.COLOR_BGR2RGB)
+        rgb_l = cv2.cvtColor(latest_imgs["wrist_l"], cv2.COLOR_BGR2RGB)
+        rgb_r = cv2.cvtColor(latest_imgs["wrist_r"], cv2.COLOR_BGR2RGB)
+
         # Resize and convert images to 256x256 uint8 format
         img_main = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(latest_imgs["main"], 256, 256)
+            image_tools.resize_with_pad(rgb_main, 256, 256)
         )
         img_l = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(latest_imgs["wrist_l"], 256, 256)
+            image_tools.resize_with_pad(rgb_l, 256, 256)
         )
         img_r = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(latest_imgs["wrist_r"], 256, 256)
+            image_tools.resize_with_pad(rgb_r, 256, 256)
         )
 
+        # Only use first 7 joints per arm (aligned with LeRobot dataset)
+        q_left = latest_q["left"][:7].astype(np.float32)
+        q_right = latest_q["right"][:7].astype(np.float32)
+
         # Concatenate left and right joint positions to create state vector
-        state = np.concatenate([latest_q["left"], latest_q["right"]], axis=0)
+        state = np.concatenate([q_left, q_right], axis=0)
 
         # Keys: observation/image, observation/wrist_image, observation/right_wrist_image, observation/state
         obs = {
@@ -138,42 +134,9 @@ def main():
             continue
 
         # Split action into left and right arm commands (14-dim total: 7 joints per arm)
-        # Assuming action is 14-dim: [left_7_joints, right_7_joints]
+        # Actions are absolute joint positions from the policy
         action_left = a0[:7]
         action_right = a0[7:14]
-
-        # SMOOTHING: Apply EMA (Exponential Moving Average) filter for smoother motion
-        if ENABLE_SMOOTHING:
-            if smoothed_action["left"] is None:
-                # Initialize with current action on first run
-                smoothed_action["left"] = action_left.copy()
-                smoothed_action["right"] = action_right.copy()
-            else:
-                # Apply EMA: smoothed = alpha * new + (1-alpha) * previous
-                smoothed_action["left"] = SMOOTHING_ALPHA * action_left + (1 - SMOOTHING_ALPHA) * smoothed_action["left"]
-                smoothed_action["right"] = SMOOTHING_ALPHA * action_right + (1 - SMOOTHING_ALPHA) * smoothed_action["right"]
-
-                action_left = smoothed_action["left"]
-                action_right = smoothed_action["right"]
-                rospy.logdebug(f"Applied EMA smoothing with alpha={SMOOTHING_ALPHA}")
-
-        # SAFETY: Check and clip action deltas if needed
-        if ENABLE_ACTION_CLIPPING:
-            delta_left = action_left - latest_q["left"][:7]
-            delta_right = action_right - latest_q["right"][:7]
-
-            max_delta_left = np.abs(delta_left).max()
-            max_delta_right = np.abs(delta_right).max()
-
-            if max_delta_left > MAX_JOINT_DELTA:
-                rospy.logwarn(f"[SAFETY] Left arm delta too large ({max_delta_left:.3f}), clipping to {MAX_JOINT_DELTA}")
-                delta_left = np.clip(delta_left, -MAX_JOINT_DELTA, MAX_JOINT_DELTA)
-                action_left = latest_q["left"][:7] + delta_left
-
-            if max_delta_right > MAX_JOINT_DELTA:
-                rospy.logwarn(f"[SAFETY] Right arm delta too large ({max_delta_right:.3f}), clipping to {MAX_JOINT_DELTA}")
-                delta_right = np.clip(delta_right, -MAX_JOINT_DELTA, MAX_JOINT_DELTA)
-                action_right = latest_q["right"][:7] + delta_right
 
         # Create JointState messages for both arms
         cmd_left = JointState()
