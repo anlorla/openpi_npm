@@ -58,8 +58,8 @@ def main():
     rospy.Subscriber("/robot/arm_right/joint_states_single", JointState, cb_joints_right, queue_size=1)
 
     # Create publishers to send actions to robot arms
-    pub_left = rospy.Publisher("/robot/arm_left/vla_pos_cmd", JointState, queue_size=1)
-    pub_right = rospy.Publisher("/robot/arm_right/vla_pos_cmd", JointState, queue_size=1)
+    pub_left = rospy.Publisher("/robot/arm_left/vla_joint_cmd", JointState, queue_size=1)
+    pub_right = rospy.Publisher("/robot/arm_right/vla_joint_cmd", JointState, queue_size=1)
 
     rospy.loginfo("Robot arm command publishers initialized")
 
@@ -72,6 +72,9 @@ def main():
     # SAFETY: Use low control frequency for initial testing
     rate = rospy.Rate(10)  # Run at 10 Hz to match training data collection frequency
     prompt = "Push the block to the right and then move both arms back to the home pose."
+
+    # Number of actions to execute from each predicted action chunk
+    num_actions_to_execute = 15
 
     rospy.loginfo("Waiting for sensor data from robot arms...")
     data_ready_logged = False
@@ -124,37 +127,46 @@ def main():
         rospy.loginfo_throttle(5.0, "✓ Successfully communicated with policy server")
 
         actions = np.array(result["actions"])
-        a0 = actions[0]  # First action in the predicted action chunk
         rospy.loginfo_throttle(5.0, f"✓ Successfully received action from policy server, shape: {actions.shape}")
 
-        # Validate action dimension
-        if len(a0) != 14:
-            rospy.logwarn(f"[SAFETY] Invalid action dimension: expected 14, got {len(a0)}. Skipping this action.")
+        # Determine how many actions to execute (min of num_actions_to_execute and available actions)
+        num_to_exec = min(num_actions_to_execute, len(actions))
+        rospy.loginfo(f"Executing {num_to_exec} actions from predicted chunk of {len(actions)}")
+
+        # Execute the first num_to_exec actions from the predicted chunk
+        for i in range(num_to_exec):
+            if rospy.is_shutdown():
+                break
+
+            action = actions[i]
+
+            # Validate action dimension
+            if len(action) != 14:
+                rospy.logwarn(f"[SAFETY] Invalid action dimension at index {i}: expected 14, got {len(action)}. Skipping this action.")
+                continue
+
+            # Split action into left and right arm commands (14-dim total: 7 joints per arm)
+            # Actions are absolute joint positions from the policy
+            action_left = action[:7]
+            action_right = action[7:14]
+
+            # Create JointState messages for both arms
+            cmd_left = JointState()
+            cmd_left.header.stamp = rospy.Time.now()
+            cmd_left.position = action_left.tolist()
+
+            cmd_right = JointState()
+            cmd_right.header.stamp = rospy.Time.now()
+            cmd_right.position = action_right.tolist()
+
+            # Publish commands to robot arms
+            pub_left.publish(cmd_left)
+            pub_right.publish(cmd_right)
+            rospy.loginfo(f"✓ Sent action {i+1}/{num_to_exec} to robot arms")
+            rospy.logdebug(f"  Left arm:  [{', '.join([f'{x:.3f}' for x in action_left])}]")
+            rospy.logdebug(f"  Right arm: [{', '.join([f'{x:.3f}' for x in action_right])}]")
+
             rate.sleep()
-            continue
-
-        # Split action into left and right arm commands (14-dim total: 7 joints per arm)
-        # Actions are absolute joint positions from the policy
-        action_left = a0[:7]
-        action_right = a0[7:14]
-
-        # Create JointState messages for both arms
-        cmd_left = JointState()
-        cmd_left.header.stamp = rospy.Time.now()
-        cmd_left.position = action_left.tolist()
-
-        cmd_right = JointState()
-        cmd_right.header.stamp = rospy.Time.now()
-        cmd_right.position = action_right.tolist()
-
-        # Publish commands to robot arms
-        pub_left.publish(cmd_left)
-        pub_right.publish(cmd_right)
-        rospy.loginfo(f"✓ Successfully sent actions to robot arms")
-        rospy.loginfo(f"  Left arm:  [{', '.join([f'{x:.3f}' for x in action_left])}]")
-        rospy.loginfo(f"  Right arm: [{', '.join([f'{x:.3f}' for x in action_right])}]")
-
-        rate.sleep()
 
 if __name__ == "__main__":
     main()
