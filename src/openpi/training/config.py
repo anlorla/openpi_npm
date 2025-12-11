@@ -985,6 +985,35 @@ _CONFIGS = [
 
     # Edited by Yifan
     # NPM tasks - PiPER (Full Fine-tuning)
+        TrainConfig(
+        name="pi0_npm",
+        # Dual-arm robot with 14-dim actions (7 per arm) and 16-dim state (8 per arm)
+        model=pi0_config.Pi0Config(
+            pi05=False,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotZenoDataConfig(
+            repo_id="Anlorla/sweep2E_dualarm_v1_primitives_200",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),  # Specify the action key from dataset
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        pytorch_weight_path=None,  # not use for now
+        num_train_steps=12_000,
+    ),
     TrainConfig(
         name="pi05_npm",
         # Dual-arm robot with 14-dim actions (7 per arm) and 16-dim state (8 per arm)
