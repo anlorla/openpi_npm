@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 import cv2
 import numpy as np
+from collections import deque
 import rospy
 from sensor_msgs.msg import CompressedImage, JointState
 from cv_bridge import CvBridge
 
 from openpi_client import websocket_client_policy, image_tools
-
+import threading
 bridge = CvBridge()
 
 # Store latest sensor data
@@ -69,12 +70,66 @@ def main():
         port=8000,
     )
 
-    # SAFETY: Use low control frequency for initial testing
-    rate = rospy.Rate(10)  # Run at 10 Hz to match training data collection frequency
-    prompt = "Push the block to the right and then move both arms back to the home pose."
+    # ========== RTC Configuration ==========
+    # Based on latency test: 195ms @ different frequencies
+    # RTC Constraint: d ≤ s ≤ H - d 
+    #
+    # Option 1: 25 Hz → d=5, s∈[5,15], choose s=8
+    # Option 2: 20 Hz → d=4, s∈[4,16], choose s=8
+    # Option 3: 10 Hz → d=2, s∈[2,18], choose s=10
 
-    # Number of actions to execute from each predicted action chunk
-    num_actions_to_execute = 15
+    CONTROL_FREQ = 25     # Hz - reduced from 50Hz to satisfy RTC constraint
+    ACTION_HORIZON = 20   # steps - from training config (model predicts 20 steps)
+
+    # Calculate inference_delay from latency test
+    LATENCY_MS = 198      # 95th percentile from test
+    INFERENCE_DELAY = int(np.ceil(LATENCY_MS / (1000.0 / CONTROL_FREQ)))
+
+    # Choose execute_horizon within valid range [d, H-d]
+    MIN_EXECUTE_HORIZON = INFERENCE_DELAY
+    MAX_EXECUTE_HORIZON = ACTION_HORIZON - INFERENCE_DELAY
+    EXECUTE_HORIZON = 8   # Conservative choice within valid range
+
+    # Validate RTC constraint
+    assert INFERENCE_DELAY <= EXECUTE_HORIZON <= ACTION_HORIZON - INFERENCE_DELAY, \
+        f"RTC constraint violated! d={INFERENCE_DELAY}, s={EXECUTE_HORIZON}, H-d={ACTION_HORIZON-INFERENCE_DELAY}"
+        
+    rtc_lock = threading.Lock()
+    rtc_cond = threading.Condition(rtc_lock)
+
+    rtc_state = {
+        "cur_chunk": None,          # np.ndarray [H, 14]
+        "t": 0,                     # Current time step in episode
+        "last_obs": None,           # Latest observation dict
+        "delay_steps": deque(maxlen=10),  # Recent delay measurements
+        "inference_running": False,
+        "shutdown": False,
+    }
+    
+    
+
+    rospy.loginfo("="*60)
+    rospy.loginfo("RTC Configuration (Corrected):")
+    rospy.loginfo(f"  Control frequency:  {CONTROL_FREQ} Hz (period: {1000/CONTROL_FREQ:.1f}ms)")
+    rospy.loginfo(f"  Latency (95th):     {LATENCY_MS} ms")
+    rospy.loginfo(f"  Inference delay:    {INFERENCE_DELAY} steps")
+    rospy.loginfo(f"  Execute horizon:    {EXECUTE_HORIZON} steps")
+    rospy.loginfo(f"  Action horizon:     {ACTION_HORIZON} steps")
+    rospy.loginfo(f"  Valid s range:      [{MIN_EXECUTE_HORIZON}, {MAX_EXECUTE_HORIZON}]")
+    rospy.loginfo(f"  RTC constraint:     {INFERENCE_DELAY} ≤ {EXECUTE_HORIZON} ≤ {ACTION_HORIZON - INFERENCE_DELAY} ✓")
+    rospy.loginfo("="*60)
+    rospy.loginfo("NOTE: Current implementation is 'Simplified RTC'")
+    rospy.loginfo("      - Has action chunking strategy ✓")
+    rospy.loginfo("      - Missing prefix attention guidance (soft-mask) ✗")
+    rospy.loginfo("      - For full RTC, need to modify model inference")
+    rospy.loginfo("="*60)
+
+    rate = rospy.Rate(CONTROL_FREQ)
+    prompt = "<Clear> <Box> <0.5, 0.5, 0.7, 0.7>"  # Training format prompt
+
+    # ========== RTC State Variables ==========
+    action_plan = deque()           # Queue of actions to execute
+    old_chunk = None                 # Previous chunk (for RTC during inference)
 
     rospy.loginfo("Waiting for sensor data from robot arms...")
     data_ready_logged = False
@@ -89,68 +144,109 @@ def main():
             rospy.loginfo("✓ Successfully receiving observations from robot arms (cameras + joint states)")
             data_ready_logged = True
 
-        # Convert images from BGR (ROS default) to RGB
-        rgb_main = cv2.cvtColor(latest_imgs["main"], cv2.COLOR_BGR2RGB)
-        rgb_l = cv2.cvtColor(latest_imgs["wrist_l"], cv2.COLOR_BGR2RGB)
-        rgb_r = cv2.cvtColor(latest_imgs["wrist_r"], cv2.COLOR_BGR2RGB)
+        # ========== Step 3: RTC with Inference Delay Handling ==========
+        # Check if we need to request a new action chunk
+        if not action_plan:
+            rospy.loginfo(f"[RTC] Action plan empty, requesting new chunk...")
 
-        # Resize and convert images to 256x256 uint8 format
-        img_main = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(rgb_main, 256, 256)
-        )
-        img_l = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(rgb_l, 256, 256)
-        )
-        img_r = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(rgb_r, 256, 256)
-        )
+            # Prepare observation
+            rgb_main = cv2.cvtColor(latest_imgs["main"], cv2.COLOR_BGR2RGB)
+            rgb_l = cv2.cvtColor(latest_imgs["wrist_l"], cv2.COLOR_BGR2RGB)
+            rgb_r = cv2.cvtColor(latest_imgs["wrist_r"], cv2.COLOR_BGR2RGB)
 
-        # Only use first 7 joints per arm (aligned with LeRobot dataset)
-        q_left = latest_q["left"][:7].astype(np.float32)
-        q_right = latest_q["right"][:7].astype(np.float32)
+            img_main = image_tools.convert_to_uint8(
+                image_tools.resize_with_pad(rgb_main, 224, 224)
+            )
+            img_l = image_tools.convert_to_uint8(
+                image_tools.resize_with_pad(rgb_l, 224, 224)
+            )
+            img_r = image_tools.convert_to_uint8(
+                image_tools.resize_with_pad(rgb_r, 224, 224)
+            )
 
-        # Concatenate left and right joint positions to create state vector
-        state = np.concatenate([q_left, q_right], axis=0)
+            q_left = latest_q["left"][:7].astype(np.float32)
+            q_right = latest_q["right"][:7].astype(np.float32)
+            state = np.concatenate([q_left, q_right], axis=0)
 
-        # Keys: observation/image, observation/wrist_image, observation/right_wrist_image, observation/state
-        obs = {
-            "observation/image": img_main,  
-            "observation/wrist_image": img_l,  
-            "observation/right_wrist_image": img_r,  
-            "observation/state": state,  
-            "prompt": prompt,
-        }
+            obs = {
+                "observation/image": img_main,
+                "observation/wrist_image": img_l,
+                "observation/right_wrist_image": img_r,
+                "observation/state": state,
+                "prompt": prompt,
+            }
 
-        # Send observation to policy server and get action prediction
-        rospy.logdebug("Sending observation to policy server...")
-        result = client.infer(obs)
-        rospy.loginfo_throttle(5.0, "✓ Successfully communicated with policy server")
+            # CRITICAL: During inference (195ms = 10 steps), we need to execute old actions
+            # This is the core of RTC!
 
-        actions = np.array(result["actions"])
-        rospy.loginfo_throttle(5.0, f"✓ Successfully received action from policy server, shape: {actions.shape}")
+            # Request new action chunk from policy server (this will block for ~195ms)
+            result = client.infer(obs)
+            new_chunk = np.array(result["actions"])  # Shape: [ACTION_HORIZON, 14]
 
-        # Determine how many actions to execute (min of num_actions_to_execute and available actions)
-        num_to_exec = min(num_actions_to_execute, len(actions))
-        rospy.loginfo(f"Executing {num_to_exec} actions from predicted chunk of {len(actions)}")
+            rospy.loginfo(f"[RTC] Received new chunk: shape={new_chunk.shape}")
 
-        # Execute the first num_to_exec actions from the predicted chunk
-        for i in range(num_to_exec):
-            if rospy.is_shutdown():
-                break
+            # ========== RTC Logic: Build action_plan ==========
+            # RTC Strategy from real-time-chunking-kinetix (eval_flow.py:120-135):
+            #
+            # action_chunk_to_execute = concatenate([
+            #     old_chunk[:inference_delay],               # Old actions (during inference)
+            #     new_chunk[inference_delay:execute_horizon] # New actions (after inference)
+            # ])
+            #
+            # In our implementation:
+            # - Old actions were already added to action_plan before this inference
+            # - During inference (195ms), they were being executed
+            # - Now we only add the NEW actions from the new chunk
 
-            action = actions[i]
+            if old_chunk is not None:
+                # We have an old chunk - RTC active!
+                rospy.loginfo(f"[RTC] Old chunk exists, applying RTC strategy")
+
+                # During the inference just completed (~195ms = 10 steps):
+                # - Steps 0-9 of old_chunk were executing
+                # - We acknowledge this by not re-adding them
+
+                # Now add the NEW part: new_chunk[INFERENCE_DELAY:EXECUTE_HORIZON]
+                start_idx = INFERENCE_DELAY   # Start from step 10
+                end_idx = EXECUTE_HORIZON      # End at step 13
+
+                for i in range(start_idx, min(end_idx, len(new_chunk))):
+                    action_plan.append(new_chunk[i])
+
+                rospy.loginfo(f"[RTC] Added {len(action_plan)} actions from new_chunk[{start_idx}:{end_idx}]")
+                rospy.loginfo(f"[RTC] Total to execute: {EXECUTE_HORIZON} steps "
+                             f"(inference_delay={INFERENCE_DELAY} already done + {end_idx-start_idx} new)")
+            else:
+                # First chunk - cold start, no RTC yet
+                rospy.loginfo(f"[RTC] First chunk (cold start) - taking first {EXECUTE_HORIZON} actions")
+                for i in range(min(EXECUTE_HORIZON, len(new_chunk))):
+                    action_plan.append(new_chunk[i])
+
+            # Update old_chunk for next iteration
+            # Shift the chunk: discard executed portion, keep unexecuted portion
+            # This simulates: next_chunk = concat([new_chunk[execute_horizon:], zeros])
+            if len(new_chunk) > EXECUTE_HORIZON:
+                old_chunk = new_chunk[EXECUTE_HORIZON:]  # Keep unexecuted portion
+            else:
+                old_chunk = np.zeros((0, 14))  # All used up
+
+            rospy.loginfo(f"[RTC] Saved {len(old_chunk)} unexecuted actions for next cycle")
+
+        # ========== Execute next action from plan ==========
+        if action_plan:
+            action = action_plan.popleft()
 
             # Validate action dimension
             if len(action) != 14:
-                rospy.logwarn(f"[SAFETY] Invalid action dimension at index {i}: expected 14, got {len(action)}. Skipping this action.")
+                rospy.logwarn(f"[SAFETY] Invalid action dimension: expected 14, got {len(action)}. Skipping.")
+                rate.sleep()
                 continue
 
-            # Split action into left and right arm commands (14-dim total: 7 joints per arm)
-            # Actions are absolute joint positions from the policy
+            # Split action into left and right arm commands
             action_left = action[:7]
             action_right = action[7:14]
 
-            # Create JointState messages for both arms
+            # Create and publish JointState messages
             cmd_left = JointState()
             cmd_left.header.stamp = rospy.Time.now()
             cmd_left.position = action_left.tolist()
@@ -159,14 +255,12 @@ def main():
             cmd_right.header.stamp = rospy.Time.now()
             cmd_right.position = action_right.tolist()
 
-            # Publish commands to robot arms
             pub_left.publish(cmd_left)
             pub_right.publish(cmd_right)
-            rospy.loginfo(f"✓ Sent action {i+1}/{num_to_exec} to robot arms")
-            rospy.logdebug(f"  Left arm:  [{', '.join([f'{x:.3f}' for x in action_left])}]")
-            rospy.logdebug(f"  Right arm: [{', '.join([f'{x:.3f}' for x in action_right])}]")
 
-            rate.sleep()
+            rospy.loginfo_throttle(2.0, f"[RTC] Executing action, {len(action_plan)} remaining in plan")
+
+        rate.sleep()
 
 if __name__ == "__main__":
     main()
