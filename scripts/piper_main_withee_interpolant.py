@@ -3,19 +3,24 @@ import cv2
 import numpy as np
 import rospy
 from sensor_msgs.msg import CompressedImage, JointState
+from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 
 from openpi_client import websocket_client_policy, image_tools
 
 bridge = CvBridge()
 
-# Store latest sensor data (3 cameras + 2 arms joint states)
+# Store latest sensor data (3 cameras + 2 arms joint states + 2 arms end effector poses)
 latest_imgs = {
     "main": None,
     "wrist_l": None,
     "wrist_r": None,
 }
 latest_q = {
+    "left": None,
+    "right": None,
+}
+latest_ee_pose = {
     "left": None,
     "right": None,
 }
@@ -53,8 +58,33 @@ def cb_joints_right(msg):
     latest_q["right"] = np.array(msg.position, dtype=np.float32)
     rospy.logdebug(f"Received right arm joint states: {latest_q['right'][:3]}...")
 
+
+def cb_ee_pose_left(msg):
+    """Left arm end effector pose callback."""
+    # Extract position and orientation (quaternion) from PoseStamped
+    pose = msg.pose
+    ee_vec = np.array([
+        pose.position.x, pose.position.y, pose.position.z,
+        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w
+    ], dtype=np.float32)
+    latest_ee_pose["left"] = ee_vec
+    rospy.logdebug(f"Received left arm end effector pose: pos=[{pose.position.x:.3f}, {pose.position.y:.3f}, {pose.position.z:.3f}]")
+
+
+def cb_ee_pose_right(msg):
+    """Right arm end effector pose callback."""
+    # Extract position and orientation (quaternion) from PoseStamped
+    pose = msg.pose
+    ee_vec = np.array([
+        pose.position.x, pose.position.y, pose.position.z,
+        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w
+    ], dtype=np.float32)
+    latest_ee_pose["right"] = ee_vec
+    rospy.logdebug(f"Received right arm end effector pose: pos=[{pose.position.x:.3f}, {pose.position.y:.3f}, {pose.position.z:.3f}]")
+
+
 def main():
-    rospy.init_node("pi05_zeno_main")
+    rospy.init_node("pi05_zeno_main_withee_interpolant")
 
     # ====== Subscriptions / publications ======
     rospy.Subscriber(
@@ -86,6 +116,20 @@ def main():
         "/robot/arm_right/joint_states_single",
         JointState,
         cb_joints_right,
+        queue_size=1,
+    )
+
+    # Subscribe to end effector pose topics
+    rospy.Subscriber(
+        "/robot/arm_left/end_pose",
+        PoseStamped,
+        cb_ee_pose_left,
+        queue_size=1,
+    )
+    rospy.Subscriber(
+        "/robot/arm_right/end_pose",
+        PoseStamped,
+        cb_ee_pose_right,
         queue_size=1,
     )
 
@@ -123,7 +167,7 @@ def main():
     image_size = 224
 
     # Prompt matches your fine-tuning / dataset format
-    prompt = "<Sweep> <Box> <0.349, 0.500, 0.537, 0.500> <to> <Position> <0.693, 0.549>"
+    prompt = "Sweep lego blocks to yellow cross marker."
 
     # ====== Chunk execution state ======
     current_chunk = None  # np.ndarray [H, 14]
@@ -136,18 +180,18 @@ def main():
 
     while not rospy.is_shutdown():
         # ------------------------------------------------------------------
-        # 1) Wait until we have all required observations
+        # 1) Wait until we have all required observations (including end effector poses)
         # ------------------------------------------------------------------
-        if any(v is None for v in latest_imgs.values()) or any(
-            v is None for v in latest_q.values()
-        ):
+        if (any(v is None for v in latest_imgs.values()) or
+            any(v is None for v in latest_q.values()) or
+            any(v is None for v in latest_ee_pose.values())):
             rate.sleep()
             continue
 
         if not data_ready_logged:
             rospy.loginfo(
                 "✓ Successfully receiving observations from robot arms "
-                "(cameras + joint states)"
+                "(cameras + joint states + end effector poses)"
             )
             data_ready_logged = True
 
@@ -160,7 +204,7 @@ def main():
             rgb_l = cv2.cvtColor(latest_imgs["wrist_l"], cv2.COLOR_BGR2RGB)
             rgb_r = cv2.cvtColor(latest_imgs["wrist_r"], cv2.COLOR_BGR2RGB)
 
-            # Resize + uint8 conversion 
+            # Resize + uint8 conversion
             img_main = image_tools.convert_to_uint8(
                 image_tools.resize_with_pad(rgb_main, image_size, image_size)
             )
@@ -176,11 +220,15 @@ def main():
             q_right = latest_q["right"][:7].astype(np.float32)
             state = np.concatenate([q_left, q_right], axis=0)
 
+            # Concatenate left and right end effector poses (each is 7-dim: [x, y, z, qx, qy, qz, qw])
+            ee_pose = np.concatenate([latest_ee_pose["left"], latest_ee_pose["right"]], axis=0)
+
             obs = {
                 "observation/image": img_main,
                 "observation/wrist_image": img_l,
                 "observation/right_wrist_image": img_r,
                 "observation/state": state,
+                "observation/ee_pose": ee_pose,
                 "prompt": prompt,
             }
 
@@ -280,7 +328,8 @@ def main():
         prev_action_left = action_left
         prev_action_right = action_right
 
-    rospy.loginfo("Shutting down pi05_zeno_main")
+    rospy.loginfo("Shutting down pi05_zeno_main_withee_interpolant")
+
 
 if __name__ == "__main__":
     main()

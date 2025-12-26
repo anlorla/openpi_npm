@@ -59,10 +59,24 @@ class Policy(BasePolicy):
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
+            # RTC support for PyTorch models
+            if hasattr(model, 'realtime_action'):
+                self._realtime_action = model.realtime_action
+            else:
+                self._realtime_action = None
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
+            # RTC support for JAX models
+            if hasattr(model, 'realtime_action'):
+                # Mark string parameters as static for JIT compilation
+                self._realtime_action = nnx_utils.module_jit(
+                    model.realtime_action,
+                    static_argnames=['prefix_attention_schedule']
+                )
+            else:
+                self._realtime_action = None
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
@@ -98,6 +112,116 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+
+        outputs = self._output_transform(outputs)
+        outputs["policy_timing"] = {
+            "infer_ms": model_time * 1000,
+        }
+        return outputs
+
+    def realtime_action(
+        self,
+        obs: dict,
+        *,
+        num_flow_steps: int,
+        prev_action_chunk: np.ndarray,
+        inference_delay: int,
+        execute_horizon: int,
+        prefix_attention_schedule: str = "exp",
+        max_guidance_weight: float = 5.0,
+    ) -> dict:
+        """
+        Real-time action generation with guided inference for action chunking.
+
+        Implements RTC (Real-Time Chunking) from "Real-Time Execution of Action Chunking
+        Flow Policies" (Black et al., 2025). Uses VJP-based guidance to align new action
+        chunks with previously executed actions in the prefix region.
+
+        Args:
+            obs: Observation dictionary containing images, state, and prompt
+            num_flow_steps: Number of denoising steps (n in paper)
+            prev_action_chunk: Previous action chunk [H, action_dim]
+            inference_delay: Committed prefix length (d in paper)
+            execute_horizon: Number of actions executed since last inference (s in paper)
+            prefix_attention_schedule: Weight decay schedule ("linear", "exp", "ones", "zeros")
+            max_guidance_weight: Maximum guidance strength (β in paper)
+
+        Returns:
+            Dictionary with "actions" key containing generated action chunk [H, action_dim]
+        """
+        if self._realtime_action is None:
+            raise NotImplementedError(
+                "Model does not support realtime_action. "
+                "Ensure your model (e.g., Pi0Model) implements the realtime_action method."
+            )
+
+        # Make a copy since transformations may modify the inputs in place
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+
+        # Calculate prefix_attention_horizon from execute_horizon
+        # In the paper: prefix_attention_horizon = H - s
+        prefix_attention_horizon = prev_action_chunk.shape[0] - execute_horizon
+
+        if not self._is_pytorch_model:
+            # JAX model
+            # Add batch dimension and convert to jax.Array
+            inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+            prev_action_chunk_batched = jnp.asarray(prev_action_chunk)[np.newaxis, ...]
+
+            self._rng, sample_rng = jax.random.split(self._rng)
+
+            observation = _model.Observation.from_dict(inputs)
+            start_time = time.monotonic()
+
+            actions = self._realtime_action(
+                sample_rng,
+                observation,
+                num_flow_steps=num_flow_steps,
+                prev_action_chunk=prev_action_chunk_batched,
+                inference_delay=inference_delay,
+                prefix_attention_horizon=prefix_attention_horizon,
+                prefix_attention_schedule=prefix_attention_schedule,
+                max_guidance_weight=max_guidance_weight,
+            )
+
+            model_time = time.monotonic() - start_time
+
+            # Remove batch dimension
+            outputs = {
+                "state": inputs["state"],
+                "actions": np.asarray(actions[0, ...]),  # [H, 32] → will be sliced by output_transform
+            }
+        else:
+            # PyTorch model
+            inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
+            prev_action_chunk_batched = torch.from_numpy(prev_action_chunk).to(self._pytorch_device)[None, ...]
+
+            observation = _model.Observation.from_dict(inputs)
+            start_time = time.monotonic()
+
+            with torch.no_grad():
+                actions = self._realtime_action(
+                    self._pytorch_device,
+                    observation,
+                    num_flow_steps=num_flow_steps,
+                    prev_action_chunk=prev_action_chunk_batched,
+                    inference_delay=inference_delay,
+                    prefix_attention_horizon=prefix_attention_horizon,
+                    prefix_attention_schedule=prefix_attention_schedule,
+                    max_guidance_weight=max_guidance_weight,
+                )
+
+            model_time = time.monotonic() - start_time
+
+            # Note: Pi05 models output 32-dim actions for compatibility with various robots
+            # Dimension slicing (32→14 for dual-arm) is handled by output_transform
+            actions_np = np.asarray(actions[0, ...].detach().cpu())  # [H, 32]
+
+            outputs = {
+                "state": inputs["state"],
+                "actions": actions_np,  # [H, 32] → will be sliced by output_transform
+            }
 
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {

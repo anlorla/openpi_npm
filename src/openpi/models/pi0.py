@@ -277,3 +277,208 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def _velocity(
+        self,
+        observation: _model.Observation,
+        x_t: at.Float[at.Array, "b ah ad"],
+        time: at.Float[at.Array, " b"],
+        kv_cache,
+    ) -> at.Float[at.Array, "b ah ad"]:
+        """
+        Compute velocity field v_π(x_t, observation, time).
+
+        Extracted from sample_actions to be reused by realtime_action.
+        This ensures both methods use identical velocity computation.
+
+        Args:
+            observation: Current observation (preprocessed)
+            x_t: Noisy actions at timestep time [b, ah, ad]
+            time: Diffusion timestep [b]
+            kv_cache: Cached prefix KV states
+
+        Returns:
+            Velocity field v_t [b, ah, ad]
+        """
+        batch_size = x_t.shape[0]
+
+        # Embed suffix (action + time)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+            observation, x_t, time
+        )
+
+        # Construct attention masks
+        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+
+        # Get prefix mask for cross-attention
+        prefix_tokens, prefix_mask, _ = self.embed_prefix(observation)
+        prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+        full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+
+        # Compute positions
+        positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+        # Forward through transformer
+        (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
+        )
+        assert prefix_out is None
+
+        # Project to action space
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        return v_t
+
+    def realtime_action(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_flow_steps: int = 10,
+        prev_action_chunk: at.Float[at.Array, "b ah ad"],
+        inference_delay: int,
+        prefix_attention_horizon: int,
+        prefix_attention_schedule: str = "exp",
+        max_guidance_weight: float = 100.0,
+    ) -> _model.Actions:
+        """
+        Real-time action generation with VJP-based guidance (Algorithm 1, GUIDEDINFERENCE).
+
+        Implements guided diffusion sampling that matches prev_action_chunk in the prefix region
+        using vector-Jacobian products (VJP) for implicit differentiation.
+
+        Key steps (matching paper Algorithm 1):
+        1. Compute prefix attention weights (soft mask) - Eq. 5
+        2. Initialize from noise
+        3. For each diffusion step:
+           a. Define denoiser f(x) = x + (1-τ) * v_π(x, o, τ) - line 26
+           b. Compute VJP to get gradient ∂f/∂x - line 27
+           c. Calculate error in prefix region with soft mask - line 27
+           d. Apply correction with adaptive guidance weight - line 28
+           e. Update with corrected velocity - line 29
+
+        Args:
+            rng: Random key for noise initialization
+            observation: Current observation
+            num_flow_steps: Number of denoising steps (n in paper)
+            prev_action_chunk: Previous action chunk A_prev [b, H, D]
+            inference_delay: Committed prefix length (d in paper)
+            prefix_attention_horizon: Where prefix attention ends (H - s in paper)
+            prefix_attention_schedule: Weight decay schedule ("linear", "exp", "ones", "zeros")
+            max_guidance_weight: Maximum guidance strength (β in paper)
+
+        Returns:
+            Generated action chunk [b, ah, ad] aligned with prev_action_chunk in prefix
+        """
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_flow_steps
+        batch_size = observation.state.shape[0]
+
+        # Initialize from noise (same as sample_actions)
+        noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # Setup KV cache with prefix
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        # Compute prefix attention weights (Eq. 5 in paper)
+        weights = self._get_prefix_weights(
+            inference_delay,
+            prefix_attention_horizon,
+            self.action_horizon,
+            prefix_attention_schedule
+        )  # [H]
+
+        def step(carry):
+            x_t, time = carry
+            time_batch = jnp.broadcast_to(time, (batch_size,))
+
+            # Define denoiser for VJP (Algorithm 1, line 26)
+            # f(x) = x + (1-τ) * v_π(x, o, τ)
+            def denoiser(x_t_input):
+                v_t = self._velocity(observation, x_t_input, time_batch, kv_cache)
+                x_1 = x_t_input + v_t * (1 - time)
+                return x_1, v_t
+
+            # Compute VJP for implicit differentiation (Algorithm 1, line 27)
+            # This gives us ∂x_1/∂x_t, which tells us how to adjust x_t to match prev_action_chunk
+            x_1_pred, vjp_fun, v_t = jax.vjp(denoiser, x_t, has_aux=True)
+
+            # Prefix error with soft masking (Algorithm 1, line 27)
+            # Only enforce matching in the prefix region (weighted by schedule)
+            error = (prev_action_chunk - x_1_pred) * weights[None, :, None]  # [b, H, D]
+
+            # VJP correction: gradient of error w.r.t. x_t (Algorithm 1, line 28)
+            (pinv_correction,) = vjp_fun(error)
+
+            # Adaptive guidance weight (Eq. 5 in paper)
+            # Stronger correction when far from target (time close to 1)
+            inv_r2 = (time**2 + (1 - time)**2) / ((1 - time)**2)
+            c = jnp.nan_to_num((1 - time) / time, posinf=max_guidance_weight)
+            guidance_weight = jnp.minimum(c * inv_r2, max_guidance_weight)
+
+            # Apply correction to velocity (Algorithm 1, line 29)
+            v_t_corrected = v_t + guidance_weight * pinv_correction
+
+            return x_t + dt * v_t_corrected, time + dt
+
+        def cond(carry):
+            x_t, time = carry
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0
+
+    def _get_prefix_weights(
+        self,
+        start: int,
+        end: int,
+        total: int,
+        schedule: str
+    ) -> at.Float[at.Array, " {total}"]:
+        """
+        Compute prefix attention weights matching RTC paper Eq. 5.
+
+        Generates soft mask weights that:
+        - Force alignment in committed region [0, start)
+        - Smoothly transition in attention region [start, end)
+        - Allow free generation in [end, total)
+
+        Args:
+            start: inference_delay (d) - where free generation starts
+            end: prefix_attention_horizon (H - s) - where prefix attention ends
+            total: action_horizon (H)
+            schedule: Weight decay schedule
+
+        Returns:
+            Weights [w_0, ..., w_{total-1}] where:
+            - w_i = 1.0 for i < start (must match prev_chunk)
+            - w_i decays from 1.0 to 0.0 for start <= i < end
+            - w_i = 0.0 for i >= end (pure new generation)
+        """
+        start = jnp.minimum(start, end)
+        indices = jnp.arange(total)
+
+        if schedule == "ones":
+            # Constant weight (for debugging)
+            return jnp.ones(total)
+        elif schedule == "zeros":
+            # Hard cutoff at start (no transition)
+            return (indices < start).astype(jnp.float32)
+        elif schedule == "linear":
+            # Linear decay in transition zone
+            alpha = jnp.clip((start - 1 - indices) / (end - start + 1) + 1, 0, 1)
+            return jnp.where(indices >= end, 0.0, alpha)
+        elif schedule == "exp":
+            # Exponential decay (paper default, smoother than linear)
+            # Formula from paper: w = alpha * (exp(alpha) - 1) / (e - 1)
+            alpha = jnp.clip((start - 1 - indices) / (end - start + 1) + 1, 0, 1)
+            alpha = alpha * jnp.expm1(alpha) / (jnp.e - 1)
+            return jnp.where(indices >= end, 0.0, alpha)
+        else:
+            raise ValueError(f"Unknown schedule: {schedule}. Must be 'ones', 'zeros', 'linear', or 'exp'.")
