@@ -32,6 +32,12 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Goal mask conditioning (Approach A: inject to Action Head input)
+    use_goal_mask: bool = False  # Whether to use goal_mask conditioning
+    goal_mask_resolution: tuple[int, int] = (64, 64)  # Downsampled resolution for goal_mask
+    goal_mask_channels: int = 1  # Number of channels in goal_mask (1 for grayscale, 3 for RGB)
+    goal_mask_latent_dim: int = 256  # Latent dimension of mask encoder output vector z_k
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

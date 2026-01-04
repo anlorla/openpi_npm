@@ -21,6 +21,7 @@ import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.piper_policy as piper_policy
+import openpi.policies.piper_policy_mask as piper_policy_mask
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -353,6 +354,76 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+# Edited by Yifan
+# Config for sweep blocks task with mask as 4th image
+@dataclasses.dataclass(frozen=True)
+class LeRobotZenoSweepDataConfig(DataConfigFactory):
+    """
+    Config for Zeno PiPER dataset with sweep_mask support.
+    This extends LeRobotZenoDataConfig to add sweep_mask as the 4th image input.
+
+    This is a dual-arm robot with:
+    - 14-dim state (7 dims per arm: 6 DOF + 1 gripper)
+    - 14-dim action (7 dims per arm)
+    - 4 cameras (main/top + left wrist + right wrist + sweep_mask)
+
+    The sweep_mask is treated as an RGB image and processed by the vision encoder,
+    adding 196 tokens to the sequence (same as other camera views).
+    """
+
+    extra_delta_transform: bool = False
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # The repack transform maps dataset keys to the keys expected by the data transforms.
+        # Added sweep_mask mapping for the 4th image input
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image":        "observation.images.main",
+                        "observation/wrist_image": "observation.images.secondary_0",
+                        "observation/right_wrist_image": "observation.images.secondary_1",
+                        "observation/sweep_mask": "observation.images.sweep_mask",  # Add sweep_mask as 4th image
+                        "observation/state":              "observation.state",
+                        "actions":                         "action",
+                        "prompt": "task",
+                    }
+                )
+            ]
+        )
+
+        # Use PiperSweepInputs which handles sweep_mask as the 4th image
+        # PiperSweepOutputs returns 14-dim actions for dual-arm robot
+        data_transforms = _transforms.Group(
+            inputs=[piper_policy_mask.PiperSweepInputs(
+                model_type=model_config.model_type,
+            )],
+            outputs=[piper_policy_mask.PiperSweepOutputs()],
+        )
+
+        # For dual-arm robot: apply delta transform to all joint actions (14 dims total)
+        # Each arm has 7 joints: 6 regular joints + 1 gripper
+        # We apply delta to joints but keep gripper absolute for both arms
+        if self.extra_delta_transform:
+            # Left arm: joints 0-5 delta, joint 6 (gripper) absolute
+            # Right arm: joints 7-12 delta, joint 13 (gripper) absolute
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
 
 # Edited by Yifan
 # no end-effector pose input
@@ -1141,6 +1212,39 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path=None,  # not use for now
+        num_train_steps=30_000,
+    ),
+    # Sweep blocks with sweep_mask as 4th image input
+    TrainConfig(
+        name="pi05_npm_with_sweepmask",
+        # Dual-arm robot with 14-dim actions (7 per arm) and 14-dim state (7 per arm)
+        # Uses sweep_mask as 4th image input (adds 196 tokens to sequence)
+        # Total image tokens: 4 * 196 = 784 tokens
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=25,
+            discrete_state_input=False,
+            max_token_len=200,  # Increased from 180 to accommodate 4 images
+        ),
+        data=LeRobotZenoSweepDataConfig(
+            repo_id="Anlorla/sweep2E",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path=None,
         num_train_steps=30_000,
     ),
     # NPM tasks - PiPER (LoRA Fine-tuning for low memory)

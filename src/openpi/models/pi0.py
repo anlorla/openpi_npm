@@ -67,6 +67,10 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.use_goal_mask = config.use_goal_mask
+        self.goal_mask_resolution = config.goal_mask_resolution
+        self.goal_mask_channels = config.goal_mask_channels
+
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -90,6 +94,29 @@ class Pi0(_model.BaseModel):
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+
+        # Goal mask encoder (small CNN) - Approach A
+        if self.use_goal_mask:
+            # Input channels: goal_mask + delta_goal_mask
+            mask_input_channels = config.goal_mask_channels * 2
+            # Simple CNN: Conv -> ReLU -> Conv -> ReLU -> GlobalAvgPool -> MLP
+            self.mask_conv1 = nnx.Conv(
+                mask_input_channels, 32, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs
+            )
+            self.mask_conv2 = nnx.Conv(32, 64, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs)
+            self.mask_conv3 = nnx.Conv(64, 128, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs)
+            # After 3 strides of 2, 64x64 -> 8x8
+            # GlobalAvgPool will reduce 8x8 -> 1, so we have 128 features
+            self.mask_mlp = nnx.Linear(128, config.goal_mask_latent_dim, rngs=rngs)
+
+            # Fusion MLP: concatenate mask latent with action tokens, then project back
+            # This will be applied in embed_suffix
+            self.mask_fusion_mlp = nnx.Linear(
+                action_expert_config.width + config.goal_mask_latent_dim,
+                action_expert_config.width,
+                rngs=rngs
+            )
+
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -137,6 +164,51 @@ class Pi0(_model.BaseModel):
         return tokens, input_mask, ar_mask
 
     @at.typecheck
+    def encode_goal_mask(
+        self, obs: _model.Observation
+    ) -> at.Float[at.Array, "b latent_dim"] | None:
+        """
+        Encode goal_mask and delta_goal_mask into a latent vector z_k.
+
+        Args:
+            obs: Observation containing goal_mask and delta_goal_mask
+
+        Returns:
+            Latent vector z_k of shape [b, latent_dim], or None if goal_mask is not provided
+        """
+        if not self.use_goal_mask or obs.goal_mask is None:
+            return None
+
+        # Concatenate goal_mask and delta_goal_mask along channel dimension
+        # goal_mask: [b, h, w, c], delta_goal_mask: [b, h, w, c]
+        if obs.delta_goal_mask is not None:
+            mask_input = jnp.concatenate([obs.goal_mask, obs.delta_goal_mask], axis=-1)  # [b, h, w, 2*c]
+        else:
+            # If delta_goal_mask is not provided, use zeros
+            mask_input = jnp.concatenate([obs.goal_mask, jnp.zeros_like(obs.goal_mask)], axis=-1)
+
+        # Downsample to goal_mask_resolution if necessary
+        if mask_input.shape[1:3] != self.goal_mask_resolution:
+            from openpi.shared import image_tools
+            mask_input = image_tools.resize_with_pad(mask_input, *self.goal_mask_resolution)
+
+        # CNN encoder: Conv layers with ReLU activations
+        x = self.mask_conv1(mask_input)
+        x = nnx.relu(x)
+        x = self.mask_conv2(x)
+        x = nnx.relu(x)
+        x = self.mask_conv3(x)
+        x = nnx.relu(x)
+
+        # Global average pooling: [b, h, w, c] -> [b, c]
+        x = jnp.mean(x, axis=(1, 2))
+
+        # MLP to project to latent dimension
+        z_k = self.mask_mlp(x)  # [b, latent_dim]
+
+        return z_k
+
+    @at.typecheck
     def embed_suffix(
         self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
     ) -> tuple[
@@ -176,6 +248,19 @@ class Pi0(_model.BaseModel):
             action_time_tokens = self.action_time_mlp_out(action_time_tokens)
             action_expert_tokens = action_time_tokens
             adarms_cond = None
+
+        # Approach A: Fuse goal_mask latent with action tokens
+        if self.use_goal_mask:
+            z_k = self.encode_goal_mask(obs)  # [b, latent_dim]
+            if z_k is not None:
+                # Broadcast z_k to all action tokens: [b, latent_dim] -> [b, action_horizon, latent_dim]
+                z_k_expanded = einops.repeat(z_k, "b d -> b s d", s=self.action_horizon)
+                # Concatenate with action tokens: [b, ah, width] + [b, ah, latent_dim] -> [b, ah, width+latent_dim]
+                fused = jnp.concatenate([action_expert_tokens, z_k_expanded], axis=-1)
+                # Project back to width: [b, ah, width+latent_dim] -> [b, ah, width]
+                action_expert_tokens = self.mask_fusion_mlp(fused)
+                action_expert_tokens = nnx.swish(action_expert_tokens)
+
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens

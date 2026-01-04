@@ -15,6 +15,7 @@ def make_piper_example() -> dict:
         "observation/image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/wrist_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/right_wrist_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "observation/sweep_mask": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),  # sweep mask as 4th image
         "prompt": "do something",
     }
 
@@ -32,11 +33,12 @@ def _parse_image(image) -> np.ndarray:
 class PiperInputs(transforms.DataTransformFn):
     """
     This class is used to convert inputs to the model to the expected format for PiPER dual-arm robot.
-    It supports concatenating end-effector pose with joint state.
+    It supports concatenating end-effector pose with joint state, and optionally includes sweep_mask as 4th image.
 
     For PiPER dataset:
     - observation/state: 14-dim joint positions (7 per arm: 6 DOF + 1 gripper)
     - observation/ee_pose: 14-dim end effector poses (7 per arm: x,y,z,qx,qy,qz,qw)
+    - observation/sweep_mask: (optional) RGB image mask for sweep blocks task
     """
 
     # Determines which model will be used.
@@ -52,8 +54,14 @@ class PiperInputs(transforms.DataTransformFn):
     # Note: concat_ee_pose must be False if this is True
     use_only_ee_pose: bool = False
 
+    # Whether to include sweep_mask as the 4th image input
+    # If True, expects "observation/sweep_mask" in the data
+    # The mask will be treated as an RGB image and processed by the vision encoder
+    # Named with "sweep_" prefix to avoid confusion with attention masks
+    use_sweep_mask: bool = False
+
     def __call__(self, data: dict) -> dict:
-        # Parse images to uint8 (H,W,C)
+        # Parse the 3 standard camera images to uint8 (H,W,C) format
         base_image = _parse_image(data["observation/image"])
         wrist_image = _parse_image(data["observation/wrist_image"])
         right_wrist_image = _parse_image(data["observation/right_wrist_image"])
@@ -71,7 +79,7 @@ class PiperInputs(transforms.DataTransformFn):
             # Use only joint state
             state = data["observation/state"]
 
-        # Create inputs dict
+        # Create inputs dict with base 3 images
         inputs = {
             "state": state,
             "image": {
@@ -85,6 +93,15 @@ class PiperInputs(transforms.DataTransformFn):
                 "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
             },
         }
+
+        # Optionally add sweep_mask as 4th image
+        # This is used for sweep blocks task where the mask provides spatial guidance
+        # The mask is treated as an RGB image and processed by the vision encoder (196 tokens)
+        if self.use_sweep_mask:
+            sweep_mask_image = _parse_image(data["observation/sweep_mask"])
+            inputs["image"]["sweep_mask"] = sweep_mask_image
+            # Always use sweep_mask when provided (set mask to True)
+            inputs["image_mask"]["sweep_mask"] = np.True_
 
         # Actions are only available during training
         if "actions" in data:
