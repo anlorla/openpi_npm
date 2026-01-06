@@ -1,4 +1,15 @@
+"""
+PiPER policy for dual-arm robot.
+
+Supports:
+- 3 or 4 camera inputs (main + left wrist + right wrist + optional 4th image)
+- 14-dim state (joint positions only)
+- 14-dim action (7 per arm)
+- Optional sweep_mask as 4th image for sweep tasks
+"""
+
 import dataclasses
+from typing import Literal
 
 import einops
 import numpy as np
@@ -7,20 +18,24 @@ from openpi import transforms
 from openpi.models import model as _model
 
 
-def make_piper_example() -> dict:
+def make_piper_example(use_fourth_image: bool = False, use_sweep_mask: bool = False) -> dict:
     """Creates a random input example for the Piper policy."""
-    return {
+    example = {
         "observation/state": np.random.rand(14),  # 14-dim: dual-arm joint positions
-        "observation/ee_pose": np.random.rand(14),  # 14-dim: dual-arm end effector poses
         "observation/image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/wrist_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/right_wrist_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
-        "observation/sweep_mask": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),  # sweep mask as 4th image
         "prompt": "do something",
     }
+    if use_fourth_image:
+        example["observation/wide_top_image"] = np.random.randint(256, size=(224, 224, 3), dtype=np.uint8)
+    if use_sweep_mask:
+        example["observation/sweep_mask"] = np.random.randint(256, size=(224, 224, 3), dtype=np.uint8)
+    return example
 
 
 def _parse_image(image) -> np.ndarray:
+    """Parse image to uint8 format with shape (H, W, C)."""
     image = np.asarray(image)
     if np.issubdtype(image.dtype, np.floating):
         image = (255 * image).astype(np.uint8)
@@ -32,32 +47,27 @@ def _parse_image(image) -> np.ndarray:
 @dataclasses.dataclass(frozen=True)
 class PiperInputs(transforms.DataTransformFn):
     """
-    This class is used to convert inputs to the model to the expected format for PiPER dual-arm robot.
-    It supports concatenating end-effector pose with joint state, and optionally includes sweep_mask as 4th image.
+    Transform inputs for PiPER dual-arm robot.
 
     For PiPER dataset:
     - observation/state: 14-dim joint positions (7 per arm: 6 DOF + 1 gripper)
-    - observation/ee_pose: 14-dim end effector poses (7 per arm: x,y,z,qx,qy,qz,qw)
-    - observation/sweep_mask: (optional) RGB image mask for sweep blocks task
+    - observation/image: main camera (realsense_top)
+    - observation/wrist_image: left wrist camera (fisheye_left)
+    - observation/right_wrist_image: right wrist camera (fisheye_right)
+    - observation/wide_top_image: (optional) wide top camera as 4th image
+    - observation/sweep_mask: (optional) sweep mask as 4th image for sweep tasks
     """
 
     # Determines which model will be used.
     model_type: _model.ModelType
 
-    # Whether to concatenate end-effector pose with state
-    # If True: state will be [joint_state, ee_pose] (28-dim)
-    # If False: state will be only joint_state (14-dim)
-    concat_ee_pose: bool = True
-
-    # Whether to use only ee_pose (ignoring joint state)
-    # If True: state will be only ee_pose (14-dim)
-    # Note: concat_ee_pose must be False if this is True
-    use_only_ee_pose: bool = False
+    # Whether to include wide_top_image as the 4th image input
+    # If True, expects "observation/wide_top_image" in the data
+    use_fourth_image: bool = False
 
     # Whether to include sweep_mask as the 4th image input
     # If True, expects "observation/sweep_mask" in the data
-    # The mask will be treated as an RGB image and processed by the vision encoder
-    # Named with "sweep_" prefix to avoid confusion with attention masks
+    # Note: sweep_mask and wide_top are mutually exclusive as 4th image
     use_sweep_mask: bool = False
 
     def __call__(self, data: dict) -> dict:
@@ -66,18 +76,8 @@ class PiperInputs(transforms.DataTransformFn):
         wrist_image = _parse_image(data["observation/wrist_image"])
         right_wrist_image = _parse_image(data["observation/right_wrist_image"])
 
-        # Prepare state vector based on configuration
-        if self.use_only_ee_pose:
-            # Use only end-effector pose
-            state = data["observation/ee_pose"]
-        elif self.concat_ee_pose:
-            # Concatenate joint state and end-effector pose
-            joint_state = data["observation/state"]
-            ee_pose = data["observation/ee_pose"]
-            state = np.concatenate([joint_state, ee_pose], axis=-1)
-        else:
-            # Use only joint state
-            state = data["observation/state"]
+        # Use only joint state (14-dim)
+        state = data["observation/state"]
 
         # Create inputs dict with base 3 images
         inputs = {
@@ -94,13 +94,16 @@ class PiperInputs(transforms.DataTransformFn):
             },
         }
 
-        # Optionally add sweep_mask as 4th image
-        # This is used for sweep blocks task where the mask provides spatial guidance
-        # The mask is treated as an RGB image and processed by the vision encoder (196 tokens)
+        # Optionally add 4th image (wide_top camera)
+        if self.use_fourth_image:
+            wide_top_image = _parse_image(data["observation/wide_top_image"])
+            inputs["image"]["wide_top_0_rgb"] = wide_top_image
+            inputs["image_mask"]["wide_top_0_rgb"] = np.True_
+
+        # Optionally add sweep_mask as 4th image (for sweep tasks)
         if self.use_sweep_mask:
             sweep_mask_image = _parse_image(data["observation/sweep_mask"])
             inputs["image"]["sweep_mask"] = sweep_mask_image
-            # Always use sweep_mask when provided (set mask to True)
             inputs["image_mask"]["sweep_mask"] = np.True_
 
         # Actions are only available during training
@@ -117,7 +120,7 @@ class PiperInputs(transforms.DataTransformFn):
 @dataclasses.dataclass(frozen=True)
 class PiperOutputs(transforms.DataTransformFn):
     """
-    This class is used to convert outputs from the model back to the dataset specific format.
+    Convert model outputs back to dataset format for PiPER robot.
     Used for inference only.
 
     For PiPER dual-arm robot, we return 14-dim actions (7 per arm).
