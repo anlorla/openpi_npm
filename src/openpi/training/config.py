@@ -284,7 +284,7 @@ class TrainConfig:
     resume: bool = False
     wandb_enabled: bool = True
     policy_metadata: dict[str, Any] | None = None
-    fsdp_devices: int = 4
+    fsdp_devices: int = 1
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -354,7 +354,7 @@ _CONFIGS = [
             max_token_len=180,
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="zeno/piper_dataset",
+            repo_id="Anlorla/sweep_to_E_and_recover",
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("action",),
@@ -363,17 +363,17 @@ _CONFIGS = [
             use_fourth_image=False,
             use_sweep_mask=False,
         ),
-        batch_size=256,
+        batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=3_000,
             peak_lr=5e-5,
-            decay_steps=1_000_000,
+            decay_steps=5000,
             decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=10_000,
     ),
 
     # ------------------------------------------------------------------
@@ -385,10 +385,10 @@ _CONFIGS = [
             pi05=True,
             action_horizon=25,
             discrete_state_input=False,
-            max_token_len=200,  
+            max_token_len=180,  
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="Anlorla/sweep_to_E",
+            repo_id="Anlorla/sweep_to_E_and_recover",
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("action",),
@@ -399,15 +399,15 @@ _CONFIGS = [
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1800,
+            warmup_steps=3000,
             peak_lr=5e-5,
-            decay_steps=3000,
+            decay_steps=5000,
             decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=6000,
+        num_train_steps=10000,
     ),
 
     # ------------------------------------------------------------------
