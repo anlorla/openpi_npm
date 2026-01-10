@@ -108,7 +108,9 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    # Use asset_id for output path (supports multi-dataset case)
+    output_id = data_config.asset_id or data_config.repo_id
+    output_path = config.assets_dirs / output_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

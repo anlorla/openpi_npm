@@ -48,6 +48,8 @@ class AssetsConfig:
 class DataConfig:
     """Base data configuration."""
     repo_id: str | None = None
+    # Support multiple repo_ids for multi-dataset training
+    repo_ids: Sequence[str] | None = None
     asset_id: str | None = None
     norm_stats: dict[str, _transforms.NormStats] | None = None
     repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
@@ -128,6 +130,8 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     """Base class for data config factories."""
     repo_id: str = tyro.MISSING
+    # Support multiple repo_ids for multi-dataset training (optional)
+    repo_ids: Sequence[str] | None = None
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     base_config: tyro.conf.Suppress[DataConfig | None] = None
 
@@ -137,10 +141,13 @@ class DataConfigFactory(abc.ABC):
 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        # Use repo_ids if specified, otherwise fall back to repo_id
+        repo_ids = self.repo_ids
         asset_id = self.assets.asset_id or repo_id
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            repo_ids=repo_ids,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -181,11 +188,17 @@ class LeRobotPiperDataConfig(DataConfigFactory):
     - 14-dim state (7 per arm: 6 DOF + 1 gripper)
     - 14-dim action (7 per arm)
     - 3 or 4 cameras
+    - Single dataset (repo_id) or multiple datasets (repo_ids)
 
     Flags:
     - use_fourth_image: Use wide_top camera as 4th image
     - use_sweep_mask: Use sweep_mask as 4th image (for sweep tasks)
     - extra_delta_transform: Apply delta transform to joint actions
+
+    Multi-dataset training:
+    - Set repo_ids=["repo1", "repo2", ...] to load multiple datasets
+    - All datasets are concatenated and shuffled during training
+    - Each dataset should have compatible features (same image keys, state/action dims)
     """
 
     extra_delta_transform: bool = False
@@ -355,6 +368,44 @@ _CONFIGS = [
         ),
         data=LeRobotPiperDataConfig(
             repo_id="Anlorla/sweep_to_E_and_recover",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            extra_delta_transform=False,
+            use_fourth_image=False,
+            use_sweep_mask=False,
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=3_000,
+            peak_lr=5e-5,
+            decay_steps=5000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+    ),
+
+    # ------------------------------------------------------------------
+    # Pi0.5 - Multi-dataset training (no need to combine datasets)
+    # ------------------------------------------------------------------
+    TrainConfig(
+        name="pi05_piper_multi",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=25,
+            discrete_state_input=False,
+            max_token_len=180,
+        ),
+        data=LeRobotPiperDataConfig(
+            repo_id="sweep_and_recover_EU",  # Custom asset_id for norm_stats
+            repo_ids=[
+                "Anlorla/sweep_to_E_and_recover_lerobot21",
+                "Anlorla/sweep_to_U_and_recover_lerobot21",
+            ],
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("action",),
