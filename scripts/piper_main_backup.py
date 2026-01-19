@@ -14,7 +14,7 @@ bridge = CvBridge()
 # PREDEFINED SKILLS / PROMPTS
 # ============================================================
 SKILL_PROMPTS = {
-    "sweep": "<skill>sweep<skill> Sweep red beads into letter 'E' shape inside the masked squre.",
+    "sweep": "<skill>sweep<skill> Sweep red beads into letter 'U' shape inside the masked squre.",
     "recover": "<skill>recover<skill> Gather the red beads into a dense, contiguous pile inside the marked square with minimal gaps.",
 }
 
@@ -22,11 +22,10 @@ SKILL_PROMPTS = {
 # ROS TOPICS (aligned with convert_bag2lerobot21_dualarm.py)
 # ============================================================
 # Camera topics (updated for fisheye cameras)
-# NOTE: 主相机坏了，使用 wide_top 作为主相机
-TOPIC_CAM_MAIN = "/wide_top/image_raw/compressed"  # 原来是 /realsense_top/color/image_raw/compressed
+TOPIC_CAM_MAIN = "/realsense_top/color/image_raw/compressed"
 TOPIC_CAM_WRIST_LEFT = "/fisheye_left/image_raw/compressed"
 TOPIC_CAM_WRIST_RIGHT = "/fisheye_right/image_raw/compressed"
-TOPIC_CAM_WIDE_TOP = "/realsense_top/color/image_raw/compressed"  # 备用，如果还需要
+TOPIC_CAM_WIDE_TOP = "/wide_top/image_raw/compressed"
 
 # Joint state topics
 TOPIC_STATE_LEFT = "/robot/arm_left/joint_states_single"

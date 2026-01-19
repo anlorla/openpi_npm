@@ -38,6 +38,37 @@ import openpi.models.lora as lora
 import openpi.shared.array_typing as at
 import openpi.training.sharding as sharding
 
+
+# ============ 注意力捕获机制 ============
+# 全局开关和存储，用于在推理时捕获注意力权重
+_CAPTURE_ATTENTION = False  # 是否捕获注意力
+_CAPTURED_ATTENTION = []    # 存储每层的注意力权重
+
+
+def enable_attention_capture():
+    """启用注意力捕获"""
+    global _CAPTURE_ATTENTION, _CAPTURED_ATTENTION
+    _CAPTURE_ATTENTION = True
+    _CAPTURED_ATTENTION = []
+
+
+def disable_attention_capture():
+    """禁用注意力捕获"""
+    global _CAPTURE_ATTENTION
+    _CAPTURE_ATTENTION = False
+
+
+def get_captured_attention():
+    """获取捕获的注意力权重列表，每层一个"""
+    global _CAPTURED_ATTENTION
+    return _CAPTURED_ATTENTION
+
+
+def clear_captured_attention():
+    """清空捕获的注意力"""
+    global _CAPTURED_ATTENTION
+    _CAPTURED_ATTENTION = []
+
 PALIGEMMA_VOCAB_SIZE = 257_152
 
 
@@ -161,7 +192,7 @@ class Attention(nn.Module):
     configs: Sequence[Config]
 
     @nn.compact
-    def __call__(self, xs, positions, attn_mask, kv_cache):
+    def __call__(self, xs, positions, attn_mask, kv_cache, return_attention_weights: bool = False):
         # all experts must share the same head dim, num heads, and num kv heads for self-attention to work
         assert all(config.head_dim == self.configs[0].head_dim for config in self.configs)
         assert all(config.num_heads == self.configs[0].num_heads for config in self.configs)
@@ -227,6 +258,13 @@ class Attention(nn.Module):
 
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
 
+        # 捕获注意力权重（用于可视化）
+        if _CAPTURE_ATTENTION:
+            # 使用 debug.callback 在 JIT 编译时也能捕获
+            def _save_attention(p):
+                _CAPTURED_ATTENTION.append(p)
+            jax.debug.callback(_save_attention, probs)
+
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
 
@@ -246,6 +284,8 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
+        if return_attention_weights:
+            return out, (k, v), probs
         return out, (k, v)
 
 
