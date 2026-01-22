@@ -37,10 +37,11 @@ bridge = CvBridge()
 # ROS TOPICS (aligned with convert_bag2lerobot21_dualarm.py)
 # ============================================================
 # Camera topics
-TOPIC_CAM_MAIN = "/realsense_top/color/image_raw/compressed"
+# NOTE: 主相机坏了，使用 wide_top 作为主相机
+TOPIC_CAM_MAIN = "/wide_top/image_raw/compressed"  # 原来是 /realsense_top/color/image_raw/compressed
 TOPIC_CAM_WRIST_LEFT = "/fisheye_left/image_raw/compressed"
 TOPIC_CAM_WRIST_RIGHT = "/fisheye_right/image_raw/compressed"
-TOPIC_CAM_WIDE_TOP = "/wide_top/image_raw/compressed"
+TOPIC_CAM_WIDE_TOP = "/realsense_top/color/image_raw/compressed"  # 备用
 
 # Joint state topics
 TOPIC_STATE_LEFT = "/robot/arm_left/joint_states_single"
@@ -145,21 +146,6 @@ class DataCollector:
             "recover": f"<skill>recover<skill> Gather the red beads into a dense, contiguous pile inside the marked square with minimal gaps.",
         }
 
-        # Auto-split configuration
-        self.auto_split = args.auto_split
-        self.home_timeout = args.home_timeout
-        self.home_threshold = args.home_threshold  # Distance threshold to home pose (rad)
-        self.idle_threshold = args.idle_threshold  # Movement threshold for idle detection (rad)
-
-        # Home pose (will be calibrated at startup if auto_split is enabled)
-        self.home_pose_left = None
-        self.home_pose_right = None
-
-        # Idle detection state
-        self.last_q_left = None
-        self.last_q_right = None
-        self.idle_start_time = None
-
         # Recording directory and prefix (under DATA_COLLECT_DIR)
         sweep_dir = os.path.join(DATA_COLLECT_DIR, f"sweep_to_{self.letter}_AC")
         recover_dir = os.path.join(DATA_COLLECT_DIR, f"recover_from_{self.letter}_AC")
@@ -196,96 +182,6 @@ class DataCollector:
         # ROS publishers
         self.pub_left = rospy.Publisher(TOPIC_CMD_LEFT, JointState, queue_size=1)
         self.pub_right = rospy.Publisher(TOPIC_CMD_RIGHT, JointState, queue_size=1)
-
-    def calibrate_home_pose(self):
-        """Calibrate home pose by recording current joint positions.
-        Should be called once at startup when auto_split is enabled.
-        """
-        print("\n" + "=" * 60)
-        print("  HOME POSE CALIBRATION")
-        print("=" * 60)
-        print("Please move both arms to the HOME POSE position.")
-        print("This will be used for auto episode splitting.")
-        input("\nPress ENTER when ready to record home pose...")
-
-        # Wait for valid joint data
-        rate = rospy.Rate(10)
-        while not rospy.is_shutdown():
-            if latest_q["left"] is not None and latest_q["right"] is not None:
-                break
-            print("[WAIT] Waiting for joint state data...")
-            rate.sleep()
-
-        self.home_pose_left = latest_q["left"][:7].copy()
-        self.home_pose_right = latest_q["right"][:7].copy()
-
-        print(f"\n[CALIBRATED] Home pose recorded:")
-        print(f"  Left arm:  {np.round(self.home_pose_left, 3).tolist()}")
-        print(f"  Right arm: {np.round(self.home_pose_right, 3).tolist()}")
-        print(f"\nAuto-split settings:")
-        print(f"  Home threshold: {self.home_threshold} rad")
-        print(f"  Idle threshold: {self.idle_threshold} rad")
-        print(f"  Timeout: {self.home_timeout} sec")
-        print("=" * 60 + "\n")
-
-    def _check_auto_split(self):
-        """Check if auto-split conditions are met.
-        Returns True if episode should be terminated.
-
-        Conditions (all must be met):
-        1. Joint movement is small (idle)
-        2. Close to home pose
-        3. Above conditions sustained for home_timeout seconds
-        """
-        if not self.auto_split or self.home_pose_left is None:
-            return False
-
-        q_left = latest_q["left"][:7] if latest_q["left"] is not None else None
-        q_right = latest_q["right"][:7] if latest_q["right"] is not None else None
-
-        if q_left is None or q_right is None:
-            return False
-
-        # Condition 1: Check if idle (small joint movement)
-        is_idle = True
-        if self.last_q_left is not None and self.last_q_right is not None:
-            delta_left = np.max(np.abs(q_left - self.last_q_left))
-            delta_right = np.max(np.abs(q_right - self.last_q_right))
-            is_idle = (delta_left < self.idle_threshold) and (delta_right < self.idle_threshold)
-
-        # Update last joint positions
-        self.last_q_left = q_left.copy()
-        self.last_q_right = q_right.copy()
-
-        # Condition 2: Check if close to home pose
-        dist_left = np.max(np.abs(q_left - self.home_pose_left))
-        dist_right = np.max(np.abs(q_right - self.home_pose_right))
-        is_near_home = (dist_left < self.home_threshold) and (dist_right < self.home_threshold)
-
-        # Condition 3: Check timeout
-        current_time = time.time()
-        if is_idle and is_near_home:
-            if self.idle_start_time is None:
-                self.idle_start_time = current_time
-                rospy.logdebug("[AUTO-SPLIT] Started idle timer near home pose")
-            else:
-                elapsed = current_time - self.idle_start_time
-                if elapsed >= self.home_timeout:
-                    rospy.loginfo(f"[AUTO-SPLIT] Triggered! Idle at home for {elapsed:.1f}s")
-                    return True
-        else:
-            # Reset timer if conditions not met
-            if self.idle_start_time is not None:
-                rospy.logdebug("[AUTO-SPLIT] Reset idle timer")
-            self.idle_start_time = None
-
-        return False
-
-    def _reset_auto_split_state(self):
-        """Reset auto-split detection state for new episode."""
-        self.last_q_left = None
-        self.last_q_right = None
-        self.idle_start_time = None
 
     def _find_next_idx(self, prefix):
         """Find next available index for bag files"""
@@ -381,9 +277,6 @@ class DataCollector:
 
     def run_episode(self):
         """Run one episode, returns (bag_path, success)"""
-        # Reset auto-split state for new episode
-        self._reset_auto_split_state()
-
         # Get current task configuration
         if self.current_task == "sweep":
             prefix = self.sweep_prefix
@@ -439,17 +332,13 @@ class DataCollector:
         # Start recording
         self.start_recording(bag_path)
 
-        # Start input listener thread (manual stop always available)
+        # Start input listener thread
         self.stop_episode.clear()
         input_thread = threading.Thread(target=self._wait_for_enter)
         input_thread.daemon = True
-        input_thread.start()
+        input_thread.start() 
 
-        if self.auto_split:
-            print(f"[RUN] Episode running... (Auto-split enabled: {self.home_timeout}s at home)")
-            print("[RUN] Press ENTER to stop manually")
-        else:
-            print("[RUN] Episode running... Press ENTER to stop")
+        print("[RUN] Episode running... Press ENTER to stop")
 
         # Run policy inference loop
         rate = rospy.Rate(self.args.hz)
@@ -489,11 +378,6 @@ class DataCollector:
             if self._execute_action(action):
                 step_count += 1
                 self.action_index += 1
-
-            # Check auto-split conditions
-            if self._check_auto_split():
-                print("[AUTO-SPLIT] Episode auto-terminated (idle at home pose)")
-                break
 
             rate.sleep()
 
@@ -607,30 +491,6 @@ def parse_args():
         default=10,
         help="Control frequency in Hz (default: 10)"
     )
-    # Auto-split arguments
-    parser.add_argument(
-        "--auto-split",
-        action="store_true",
-        help="Enable automatic episode splitting when idle at home pose"
-    )
-    parser.add_argument(
-        "--home-timeout",
-        type=float,
-        default=5.0,
-        help="Time (seconds) to stay idle at home pose before auto-split (default: 5.0)"
-    )
-    parser.add_argument(
-        "--home-threshold",
-        type=float,
-        default=0.1,
-        help="Max joint distance (rad) to home pose for detection (default: 0.1)"
-    )
-    parser.add_argument(
-        "--idle-threshold",
-        type=float,
-        default=0.01,
-        help="Max joint movement (rad) per step to be considered idle (default: 0.01)"
-    )
     return parser.parse_args()
 
 
@@ -656,10 +516,6 @@ def main():
 
     # Create and run collector
     collector = DataCollector(args)
-
-    # Calibrate home pose if auto-split is enabled
-    if args.auto_split:
-        collector.calibrate_home_pose()
 
     try:
         collector.run()

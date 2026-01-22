@@ -119,7 +119,7 @@ def load_sweep_mask(mask_path):
         if mask_img is not None:
             mask_rgb = cv2.cvtColor(mask_img, cv2.COLOR_BGR2RGB)
             sweep_mask_image = image_tools.convert_to_uint8(
-                image_tools.resize_with_pad(mask_rgb, 256, 256)
+                image_tools.resize_with_pad(mask_rgb, 224, 224)
             )
             rospy.loginfo(f"Loaded sweep mask from: {mask_path}")
         else:
@@ -273,15 +273,15 @@ def main():
         rgb_l = cv2.cvtColor(latest_imgs["wrist_l"], cv2.COLOR_BGR2RGB)
         rgb_r = cv2.cvtColor(latest_imgs["wrist_r"], cv2.COLOR_BGR2RGB)
 
-        # Resize and convert images to 256x256 uint8 format
+        # Resize and convert images to 224x224 uint8 format
         img_main = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(rgb_main, 256, 256)
+            image_tools.resize_with_pad(rgb_main, 224, 224)
         )
         img_l = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(rgb_l, 256, 256)
+            image_tools.resize_with_pad(rgb_l, 224, 224)
         )
         img_r = image_tools.convert_to_uint8(
-            image_tools.resize_with_pad(rgb_r, 256, 256)
+            image_tools.resize_with_pad(rgb_r, 224, 224)
         )
 
         # Process wide_top camera if enabled
@@ -289,7 +289,7 @@ def main():
         if args.use_wide_top and latest_imgs["wide_top"] is not None:
             rgb_wide_top = cv2.cvtColor(latest_imgs["wide_top"], cv2.COLOR_BGR2RGB)
             img_wide_top = image_tools.convert_to_uint8(
-                image_tools.resize_with_pad(rgb_wide_top, 256, 256)
+                image_tools.resize_with_pad(rgb_wide_top, 224, 224)
             )
 
         # Only use first 7 joints per arm (aligned with LeRobot dataset)

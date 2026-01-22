@@ -3,8 +3,16 @@
 This script is used to compute the normalization statistics for a given config. It
 will compute the mean and standard deviation of the data in the dataset and save it
 to the config assets directory.
+
+Supports:
+1. HuggingFace cached LeRobot datasets (default)
+2. Local LeRobot datasets via --local-lerobot-root
+3. RLDS datasets (when rlds_data_dir is configured)
 """
 
+from pathlib import Path
+
+import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import tqdm
 import tyro
@@ -57,6 +65,82 @@ def create_torch_dataloader(
     return data_loader, num_batches
 
 
+def create_local_lerobot_dataloader(
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    batch_size: int,
+    num_workers: int,
+    local_lerobot_root: str,
+    max_frames: int | None = None,
+) -> tuple[_data_loader.Dataset, int]:
+    """Create a data loader for a local LeRobot dataset.
+
+    Args:
+        data_config: The data configuration.
+        action_horizon: The action horizon for delta_timestamps.
+        batch_size: The batch size.
+        num_workers: The number of worker processes.
+        local_lerobot_root: Root directory containing the local LeRobot dataset.
+        max_frames: Maximum number of frames to use (optional).
+
+    Returns:
+        A tuple of (data_loader, num_batches).
+    """
+    if data_config.repo_id is None:
+        raise ValueError("Data config must have a repo_id")
+
+    root_path = Path(local_lerobot_root)
+    if not root_path.exists():
+        raise ValueError(f"Local LeRobot root directory does not exist: {local_lerobot_root}")
+
+    # Load dataset metadata and dataset from local path
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(
+        data_config.repo_id,
+        root=root_path,
+    )
+    dataset = lerobot_dataset.LeRobotDataset(
+        data_config.repo_id,
+        root=root_path,
+        delta_timestamps={
+            key: [t / dataset_meta.fps for t in range(action_horizon)]
+            for key in data_config.action_sequence_keys
+        },
+    )
+
+    # Apply prompt from task if configured
+    if data_config.prompt_from_task:
+        dataset = _data_loader.TransformedDataset(
+            dataset, [transforms.PromptFromLeRobotTask(dataset_meta.tasks)]
+        )
+
+    # Apply repack and data transforms
+    dataset = _data_loader.TransformedDataset(
+        dataset,
+        [
+            *data_config.repack_transforms.inputs,
+            *data_config.data_transforms.inputs,
+            # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
+            RemoveStrings(),
+        ],
+    )
+
+    if max_frames is not None and max_frames < len(dataset):
+        num_batches = max_frames // batch_size
+        shuffle = True
+    else:
+        num_batches = len(dataset) // batch_size
+        shuffle = False
+
+    data_loader = _data_loader.TorchDataLoader(
+        dataset,
+        local_batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=shuffle,
+        num_batches=num_batches,
+    )
+    return data_loader, num_batches
+
+
 def create_rlds_dataloader(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -86,11 +170,38 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(
+    config_name: str,
+    max_frames: int | None = None,
+    local_lerobot_root: str | None = None,
+    output_dir: str | None = None,
+):
+    """Compute normalization statistics for a config.
+
+    Args:
+        config_name: The name of the training config.
+        max_frames: Maximum number of frames to use for computing stats (optional).
+        local_lerobot_root: Root directory for local LeRobot dataset. If provided,
+            loads the dataset from local_lerobot_root/repo_id instead of HuggingFace cache.
+            Example: --local-lerobot-root /path/to/my/datasets
+        output_dir: Output directory for saving stats. If not provided, uses
+            config.assets_dirs/repo_id.
+    """
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    if data_config.rlds_data_dir is not None:
+    if local_lerobot_root is not None:
+        # Use local LeRobot dataset
+        print(f"Loading local LeRobot dataset from: {local_lerobot_root}/{data_config.repo_id}")
+        data_loader, num_batches = create_local_lerobot_dataloader(
+            data_config,
+            config.model.action_horizon,
+            config.batch_size,
+            config.num_workers,
+            local_lerobot_root,
+            max_frames,
+        )
+    elif data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
             data_config, config.model.action_horizon, config.batch_size, max_frames
         )
@@ -108,9 +219,12 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    # Use asset_id for output path (supports multi-dataset case)
-    output_id = data_config.asset_id or data_config.repo_id
-    output_path = config.assets_dirs / output_id
+    # Determine output path
+    if output_dir is not None:
+        output_path = Path(output_dir)
+    else:
+        output_path = config.assets_dirs / data_config.repo_id
+
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

@@ -4,6 +4,7 @@ Training configurations for PiPER dual-arm robot.
 Available configs:
 - pi0_piper: Pi0 model with 3 cameras
 - pi05_piper: Pi0.5 model with 3 cameras
+- pi05_piper_widetop: Pi0.5 model with 3 cameras, using wide_top as main camera (realsense_top 坏了)
 - pi05_piper_4cam: Pi0.5 model with 4 cameras (wide_top as 4th)
 - pi05_piper_mask: Pi0.5 model with sweep_mask as 4th image
 - pi05_piper_lora: Pi0.5 LoRA fine-tuning
@@ -48,8 +49,6 @@ class AssetsConfig:
 class DataConfig:
     """Base data configuration."""
     repo_id: str | None = None
-    # Support multiple repo_ids for multi-dataset training
-    repo_ids: Sequence[str] | None = None
     asset_id: str | None = None
     norm_stats: dict[str, _transforms.NormStats] | None = None
     repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
@@ -130,8 +129,6 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     """Base class for data config factories."""
     repo_id: str = tyro.MISSING
-    # Support multiple repo_ids for multi-dataset training (optional)
-    repo_ids: Sequence[str] | None = None
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     base_config: tyro.conf.Suppress[DataConfig | None] = None
 
@@ -141,13 +138,10 @@ class DataConfigFactory(abc.ABC):
 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
-        # Use repo_ids if specified, otherwise fall back to repo_id
-        repo_ids = self.repo_ids
         asset_id = self.assets.asset_id or repo_id
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
-            repo_ids=repo_ids,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -188,17 +182,12 @@ class LeRobotPiperDataConfig(DataConfigFactory):
     - 14-dim state (7 per arm: 6 DOF + 1 gripper)
     - 14-dim action (7 per arm)
     - 3 or 4 cameras
-    - Single dataset (repo_id) or multiple datasets (repo_ids)
 
     Flags:
     - use_fourth_image: Use wide_top camera as 4th image
     - use_sweep_mask: Use sweep_mask as 4th image (for sweep tasks)
     - extra_delta_transform: Apply delta transform to joint actions
-
-    Multi-dataset training:
-    - Set repo_ids=["repo1", "repo2", ...] to load multiple datasets
-    - All datasets are concatenated and shuffled during training
-    - Each dataset should have compatible features (same image keys, state/action dims)
+    - use_wide_top_as_main: Use wide_top as main camera (swap with realsense_top)
     """
 
     extra_delta_transform: bool = False
@@ -206,18 +195,33 @@ class LeRobotPiperDataConfig(DataConfigFactory):
     use_fourth_image: bool = False
     # Whether to use sweep_mask as 4th image (for sweep tasks)
     use_sweep_mask: bool = False
+    # Whether to use wide_top as main camera (realsense_top 坏了的情况)
+    use_wide_top_as_main: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # Build repack transform based on configuration
-        repack_dict = {
-            "observation/image": "observation.images.main",
-            "observation/wrist_image": "observation.images.secondary_0",
-            "observation/right_wrist_image": "observation.images.secondary_1",
-            "observation/state": "observation.state",
-            "actions": "action",
-            "prompt": "task",
-        }
+        if self.use_wide_top_as_main:
+            # 使用 wide_top (secondary_2) 作为主相机，注释掉 realsense_top (main)
+            repack_dict = {
+                "observation/image": "observation.images.secondary_2",  # wide_top 作为主相机
+                "observation/wrist_image": "observation.images.secondary_0",  # fisheye_left
+                "observation/right_wrist_image": "observation.images.secondary_1",  # fisheye_right
+                # "observation/realsense_top": "observation.images.main",  # 坏了，注释掉
+                "observation/state": "observation.state",
+                "actions": "action",
+                "prompt": "task",
+            }
+        else:
+            # 正常配置：realsense_top 作为主相机
+            repack_dict = {
+                "observation/image": "observation.images.main",
+                "observation/wrist_image": "observation.images.secondary_0",
+                "observation/right_wrist_image": "observation.images.secondary_1",
+                "observation/state": "observation.state",
+                "actions": "action",
+                "prompt": "task",
+            }
 
         # Add 4th image mapping if needed
         if self.use_fourth_image:
@@ -367,7 +371,7 @@ _CONFIGS = [
             max_token_len=180,
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="Anlorla/sweep_to_E_and_recover",
+            repo_id="Anlorla/sweep_to_C_autosplit_v2", 
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("action",),
@@ -378,7 +382,7 @@ _CONFIGS = [
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=3_000,
+            warmup_steps=2400,
             peak_lr=5e-5,
             decay_steps=5000,
             decay_lr=5e-5,
@@ -386,14 +390,14 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=10_000,
+        num_train_steps=8000,
     ),
 
     # ------------------------------------------------------------------
-    # Pi0.5 - Multi-dataset training (no need to combine datasets)
+    # Pi0.5 - 3 cameras with wide_top as main 
     # ------------------------------------------------------------------
     TrainConfig(
-        name="pi05_piper_multi",
+        name="pi05_piper_widetop",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=25,
@@ -401,11 +405,7 @@ _CONFIGS = [
             max_token_len=180,
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="sweep_and_recover_EU",  # Custom asset_id for norm_stats
-            repo_ids=[
-                "Anlorla/sweep_to_E_and_recover_lerobot21",
-                "Anlorla/sweep_to_U_and_recover_lerobot21",
-            ],
+            repo_id="Anlorla/sweep_and_recover_EU",
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("action",),
@@ -413,6 +413,7 @@ _CONFIGS = [
             extra_delta_transform=False,
             use_fourth_image=False,
             use_sweep_mask=False,
+            use_wide_top_as_main=True, 
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -439,9 +440,9 @@ _CONFIGS = [
             max_token_len=180,  
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="Anlorla/sweep_to_E_and_recover",
+            repo_id="Anlorla/sweep_to_E_and_recover_lerobot21",
             base_config=DataConfig(
-                prompt_from_task=True,
+                prompt_from_task=True, 
                 action_sequence_keys=("action",),
             ),
             extra_delta_transform=False,
@@ -470,29 +471,29 @@ _CONFIGS = [
             pi05=True,
             action_horizon=25,
             discrete_state_input=False,
-            max_token_len=200,  # Increased for 4 images
+            max_token_len=180,
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="zeno/sweep_dataset",
+            repo_id="Anlorla/sweep_to_C_lerobot21_autosplit",
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("action",),
             ),
             extra_delta_transform=False,
             use_fourth_image=False,
-            use_sweep_mask=True,  # Enable sweep_mask
+            use_sweep_mask=True,  
         ),
-        batch_size=256,
+        batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=3000,
             peak_lr=5e-5,
-            decay_steps=1_000_000,
+            decay_steps=5000,
             decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
+        num_train_steps=10000,
     ),
 
     # ------------------------------------------------------------------
