@@ -131,60 +131,55 @@ class FakeDataset(Dataset):
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
-    """Create a dataset for training.
+    """Create a dataset for training. Supports both single and multiple repositories."""
 
-    Supports both single repo_id and multiple repo_ids for multi-dataset training.
-    When repo_ids is specified, datasets are concatenated using torch.utils.data.ConcatDataset.
-    """
-    # Determine which repo_ids to use
-    repo_ids = data_config.repo_ids
-    if repo_ids is None:
-        # Fall back to single repo_id for backward compatibility
-        repo_id = data_config.repo_id
-        if repo_id is None:
-            raise ValueError("Neither repo_id nor repo_ids is set. Cannot create dataset.")
-        if repo_id == "fake":
-            return FakeDataset(model_config, num_samples=1024)
-        repo_ids = [repo_id]
+    # Multi-repository mode
+    if data_config.repo_ids is not None:
+        logging.info(f"Loading multiple repositories: {data_config.repo_ids}")
+        datasets = []
 
-    if not repo_ids:
-        raise ValueError("repo_ids is empty. Cannot create dataset.")
+        for repo_id in data_config.repo_ids:
+            logging.info(f"Loading dataset from {repo_id}")
+            dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+            dataset = lerobot_dataset.LeRobotDataset(
+                repo_id,
+                delta_timestamps={
+                    key: [t / dataset_meta.fps for t in range(action_horizon)]
+                    for key in data_config.action_sequence_keys
+                },
+            )
 
-    # Check for fake dataset
-    if len(repo_ids) == 1 and repo_ids[0] == "fake":
+            if data_config.prompt_from_task:
+                dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+            datasets.append(dataset)
+            logging.info(f"Loaded {len(dataset)} samples from {repo_id}")
+
+        # Concatenate all datasets
+        combined_dataset = ConcatDataset(datasets)
+        logging.info(f"Combined dataset has {len(combined_dataset)} total samples")
+        return combined_dataset
+
+    # Single-repository mode (original logic)
+    repo_id = data_config.repo_id
+    if repo_id is None:
+        raise ValueError("Either repo_id or repo_ids must be set. Cannot create dataset.")
+    if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    datasets = []
-    all_tasks = {}  # Collect tasks from all datasets for prompt_from_task
+    logging.info(f"Loading single repository: {repo_id}")
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset = lerobot_dataset.LeRobotDataset(
+        data_config.repo_id,
+        delta_timestamps={
+            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+        },
+    )
 
-    for repo_id in repo_ids:
-        logging.info(f"Loading dataset from: {repo_id}")
-        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-        dataset = lerobot_dataset.LeRobotDataset(
-            repo_id,
-            delta_timestamps={
-                key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-            },
-        )
-
-        # Collect tasks from each dataset
-        all_tasks.update(dataset_meta.tasks)
-
-        datasets.append(dataset)
-        logging.info(f"  - Loaded {len(dataset)} samples from {repo_id}")
-
-    # Concatenate datasets if multiple
-    if len(datasets) == 1:
-        combined_dataset = datasets[0]
-    else:
-        combined_dataset = ConcatDataset(datasets)
-        logging.info(f"Combined {len(repo_ids)} datasets, total samples: {len(combined_dataset)}")
-
-    # Apply prompt_from_task transform with combined tasks
     if data_config.prompt_from_task:
-        combined_dataset = TransformedDataset(combined_dataset, [_transforms.PromptFromLeRobotTask(all_tasks)])
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
-    return combined_dataset
+    return dataset
 
 
 def create_rlds_dataset(
@@ -208,7 +203,10 @@ def create_rlds_dataset(
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
+    # Check if we're using fake data (single repo mode only)
+    is_fake_data = data_config.repo_id == "fake" and data_config.repo_ids is None
+
+    if not is_fake_data and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "

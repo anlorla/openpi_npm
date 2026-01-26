@@ -49,6 +49,7 @@ class AssetsConfig:
 class DataConfig:
     """Base data configuration."""
     repo_id: str | None = None
+    repo_ids: list[str] | None = None  # Support multiple repositories
     asset_id: str | None = None
     norm_stats: dict[str, _transforms.NormStats] | None = None
     repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
@@ -129,6 +130,7 @@ class ModelTransformFactory(GroupFactory):
 class DataConfigFactory(abc.ABC):
     """Base class for data config factories."""
     repo_id: str = tyro.MISSING
+    repo_ids: list[str] | None = None  # Support multiple repositories
     assets: AssetsConfig = dataclasses.field(default_factory=AssetsConfig)
     base_config: tyro.conf.Suppress[DataConfig | None] = None
 
@@ -138,10 +140,12 @@ class DataConfigFactory(abc.ABC):
 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        repo_ids = self.repo_ids  # Pass through repo_ids for multi-repo support
         asset_id = self.assets.asset_id or repo_id
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
+            repo_ids=repo_ids,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
             use_quantile_norm=model_config.model_type != ModelType.PI0,
@@ -394,10 +398,10 @@ _CONFIGS = [
     ),
 
     # ------------------------------------------------------------------
-    # Pi0.5 - 3 cameras with wide_top as main 
+    # Pi0.5 - multi-task
     # ------------------------------------------------------------------
-    TrainConfig(
-        name="pi05_piper_widetop",
+        TrainConfig(
+        name="pi05_piper_multi",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=25,
@@ -405,7 +409,11 @@ _CONFIGS = [
             max_token_len=180,
         ),
         data=LeRobotPiperDataConfig(
-            repo_id="Anlorla/sweep_and_recover_EU",
+            repo_id="recover_then_refine",  # Custom asset_id for norm_stats
+            repo_ids=[
+                "Anlorla/refine_C_lerobot21",
+                "Anlorla/recover_from_C_lerobot21",
+            ],
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=("action",),
@@ -413,7 +421,6 @@ _CONFIGS = [
             extra_delta_transform=False,
             use_fourth_image=False,
             use_sweep_mask=False,
-            use_wide_top_as_main=True, 
         ),
         batch_size=32,
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -425,9 +432,8 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=10_000,
+        num_train_steps=8_000,
     ),
-
     # ------------------------------------------------------------------
     # Pi0.5 - 4 cameras (with wide_top)
     # ------------------------------------------------------------------
